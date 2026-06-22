@@ -50,10 +50,22 @@ pub struct Settings {
     #[serde(default)]
     pub auto_start: bool,
 
+    /// Mode pengelolaan memori untuk model Whisper
+    #[serde(default)]
+    pub memory_mode: MemoryMode,
+
     /// Ambang batas RMS untuk Voice Activity Detection.
     /// Nilai default: 0.005. Jika suara lebih rendah dari ini, akan diabaikan (mencegah halusinasi).
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MemoryMode {
+    #[default]
+    LoadOnStartup,
+    LoadOnFirstUse,
+    EcoMode,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -80,6 +92,7 @@ impl Default for Settings {
             dark_mode: true, // Default to dark mode since user asked for it
             realtime: false,
             auto_start: false,
+            memory_mode: MemoryMode::LoadOnFirstUse, // Default ke hemat RAM
             vad_threshold: default_vad_threshold(),
         }
     }
@@ -216,6 +229,7 @@ mod tests {
         assert_eq!(s.device_name, parsed.device_name);
         assert_eq!(s.dark_mode, parsed.dark_mode);
         assert_eq!(s.realtime, parsed.realtime);
+        assert_eq!(s.memory_mode, parsed.memory_mode);
     }
 
     #[test]

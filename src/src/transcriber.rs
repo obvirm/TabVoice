@@ -26,8 +26,6 @@ pub enum TranscriberInput {
 
 /// Wrapper tipis di atas `WhisperModel` agar bisa di-share `Arc` ke worker thread.
 pub struct Transcriber {
-    /// Model Whisper yang sudah di-load dari file GGML.
-    model: Arc<WhisperModel>,
     /// BCP-47 language hint (mis. `"en"`, `"id"`). `None` = auto-detect.
     language: Option<String>,
     /// State aplikasi untuk setting realtime & paste
@@ -35,10 +33,9 @@ pub struct Transcriber {
 }
 
 impl Transcriber {
-    /// Buat `Transcriber` baru. `model` biasanya di-load sekali di startup dan
-    /// di-share `Arc` ke worker + UI (untuk `info()`).
-    pub fn new(model: Arc<WhisperModel>, language: Option<String>, state: Arc<crate::state::AppState>) -> Self {
-        Self { model, language, state }
+    /// Buat `Transcriber` baru.
+    pub fn new(language: Option<String>, state: Arc<crate::state::AppState>) -> Self {
+        Self { language, state }
     }
 
     /// Jalankan inference langsung tanpa spawn ke blocking thread.
@@ -49,7 +46,12 @@ impl Transcriber {
             timestamps: false,
             ..WhisperOptions::default()
         };
-        self.model.transcribe(audio, &opts)
+        let m_opt = self.state.model.lock().unwrap().clone();
+        if let Some(m) = m_opt {
+            m.transcribe(audio, &opts)
+        } else {
+            Err(WhisperError::Generic("Model not loaded".into()))
+        }
     }
 
     /// Worker loop async: terima batch samples, transcribe, emit event.
@@ -66,7 +68,33 @@ impl Transcriber {
             self.language
         );
 
-        while let Some(mut input) = release_rx.recv().await {
+        let idle_timeout = tokio::time::Duration::from_secs(15 * 60);
+
+        loop {
+            let memory_mode = self.state.settings.lock().unwrap().memory_mode;
+            let recv_res = match memory_mode {
+                crate::settings::MemoryMode::EcoMode => {
+                    tokio::time::timeout(idle_timeout, release_rx.recv()).await
+                }
+                _ => {
+                    Ok(release_rx.recv().await)
+                }
+            };
+
+            let mut input = match recv_res {
+                Ok(Some(i)) => i,
+                Ok(None) => break, // Channel closed
+                Err(_) => {
+                    // Timeout (EcoMode)
+                    let mut m = self.state.model.lock().unwrap();
+                    if m.is_some() {
+                        log::info!("EcoMode: 15 minutes idle timeout reached. Unloading model to free RAM.");
+                        *m = None;
+                    }
+                    continue;
+                }
+            };
+
             // Kuras antrean: ambil chunk paling baru.
             // Jika ada `Final` di antrean, prioritaskan `Final` dan abaikan `Partial` sebelumnya.
             while let Ok(next_input) = release_rx.try_recv() {
@@ -106,13 +134,28 @@ impl Transcriber {
                 continue;
             }
 
-            // Ambil model dari state jika ada (misal setelah reload), jika tidak fallback ke self.model
+            // Ambil model dari state jika ada. Jika None (lazy load atau di-unload EcoMode), load sekarang!
             let model = {
-                let m = self.state.model.lock().unwrap();
-                if let Some(ref current_model) = *m {
-                    std::sync::Arc::clone(current_model)
+                let m_opt = self.state.model.lock().unwrap().clone();
+                if let Some(current_model) = m_opt {
+                    current_model
                 } else {
-                    std::sync::Arc::clone(&self.model)
+                    let _ = event_tx.send(AppEvent::Partial {
+                        text: "Memuat model ke RAM...".into(),
+                    });
+                    
+                    let settings = self.state.settings.lock().unwrap().clone();
+                    
+                    let new_model = tokio::task::spawn_blocking(move || {
+                        const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
+                        match crate::ffi::WhisperModel::from_file(&settings.model_path) {
+                            Ok(m) => Arc::new(m),
+                            Err(_) => Arc::new(crate::ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES).unwrap())
+                        }
+                    }).await.expect("spawn_blocking failed");
+                    
+                    *self.state.model.lock().unwrap() = Some(Arc::clone(&new_model));
+                    new_model
                 }
             };
             let lang = self.language.clone();

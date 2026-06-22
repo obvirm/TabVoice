@@ -31,35 +31,40 @@ fn main() -> eframe::Result<()> {
     let settings = settings::load_or_default();
     log::info!("Settings loaded: model={:?}", settings.model_path);
 
-    // 3. Load WhisperModel (blocking, butuh ~detik untuk model besar).
-    //    Coba load dari path di settings dulu. Kalau gagal (misal baru pertama
-    //    kali launch dan belum download), pakai model embedded (ggml-base.bin).
-    const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
+    // 3. Load WhisperModel jika MemoryMode::LoadOnStartup
+    //    Jika mode lain, model akan di-load saat hotkey ditekan pertama kali.
+    let model_opt = if settings.memory_mode == tabvoice_lib::settings::MemoryMode::LoadOnStartup {
+        const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
 
-    let model = match tabvoice_lib::ffi::WhisperModel::from_file(&settings.model_path) {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            log::warn!(
-                "Gagal load model dari file {:?}: {e}. Memuat model bawaan (embedded)...",
-                settings.model_path
-            );
-            match tabvoice_lib::ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES) {
-                Ok(m) => Arc::new(m),
-                Err(e2) => {
-                    let msg = format!("Gagal memuat model bawaan (embedded): {e2}.");
-                    log::error!("{msg}");
-                    eprintln!("Error: {msg}");
-                    std::process::exit(1);
+        let m = match tabvoice_lib::ffi::WhisperModel::from_file(&settings.model_path) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                log::warn!(
+                    "Gagal load model dari file {:?}: {e}. Memuat model bawaan (embedded)...",
+                    settings.model_path
+                );
+                match tabvoice_lib::ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES) {
+                    Ok(m) => Arc::new(m),
+                    Err(e2) => {
+                        let msg = format!("Gagal memuat model bawaan (embedded): {e2}.");
+                        log::error!("{msg}");
+                        eprintln!("Error: {msg}");
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-    };
+        };
 
-    log::info!(
-        "WhisperModel loaded: type={}, multilingual={}",
-        model.model_type_readable(),
-        model.is_multilingual()
-    );
+        log::info!(
+            "WhisperModel loaded early: type={}, multilingual={}",
+            m.model_type_readable(),
+            m.is_multilingual()
+        );
+        Some(m)
+    } else {
+        log::info!("Memory mode is {:?}. Model will be lazy-loaded.", settings.memory_mode);
+        None
+    };
 
     // 4. Setup channels.
     //    - event_tx/rx: AppEvent antara background threads (audio, hotkey,
@@ -72,7 +77,7 @@ fn main() -> eframe::Result<()> {
     // 5. Shared state lintas thread. `Mutex` di setiap field agar lock
     //    bisa dilepas sebelum await / blocking call.
     let app_state = Arc::new(app_state::AppState {
-        model: Mutex::new(Some(Arc::clone(&model))),
+        model: Mutex::new(model_opt),
         recorder: Mutex::new(app_state::RecorderState::default()),
         release_tx: Mutex::new(Some(release_tx)),
         settings: Mutex::new(settings.clone()),
@@ -89,7 +94,7 @@ fn main() -> eframe::Result<()> {
     Box::leak(Box::new(rt));
 
     // 7. Spawn transcriber worker di tokio runtime.
-    let transcriber = transcriber::Transcriber::new(model, settings.language.clone(), Arc::clone(&app_state));
+    let transcriber = transcriber::Transcriber::new(settings.language.clone(), Arc::clone(&app_state));
     let event_tx_for_transcriber = event_tx.clone();
     rt_handle.spawn(async move {
         transcriber.run_loop(release_rx, event_tx_for_transcriber).await;

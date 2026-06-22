@@ -38,6 +38,7 @@ pub struct TabVoice {
     pub temp_dark_mode: bool,
     pub temp_realtime: bool,
     pub temp_auto_start: bool,
+    pub temp_memory_mode: crate::settings::MemoryMode,
     pub temp_vad_threshold: f32,
     
     pub current_window_size: egui::Vec2,
@@ -74,6 +75,7 @@ impl TabVoice {
             temp_dark_mode: true,
             temp_realtime: false,
             temp_auto_start: false,
+            temp_memory_mode: crate::settings::MemoryMode::LoadOnFirstUse,
             temp_vad_threshold: 0.005,
             current_window_size: egui::vec2(48.0, 48.0),
             download_progress: None,
@@ -113,6 +115,7 @@ impl TabVoice {
                 self.mode = UiMode::Done;
                 self.fade_timer = 120; // 2s @ 60fps
                 self.amp_history.clear();
+                self.download_progress = None;
             }
             AppEvent::ActiveHotkeyCaptured => {
                 let current_settings = self.state.settings.lock().unwrap().clone();
@@ -142,6 +145,7 @@ impl TabVoice {
                             self.text = format!("Gagal memuat model: {}", e);
                             self.mode = UiMode::Done;
                             self.fade_timer = 120;
+                            let _ = std::fs::remove_file(&current_model_path);
                         }
                     }
                 }
@@ -152,6 +156,10 @@ impl TabVoice {
     fn handle_tray(&mut self, action: TrayAction) {
         match action {
             TrayAction::ReloadModel => {
+                if self.download_progress.is_some() {
+                    return; // Abaikan, sedang proses download
+                }
+                
                 let current_model_path = self.state.settings.lock().unwrap().model_path.clone();
                 if current_model_path.exists() {
                     let _ = self.event_tx.send(AppEvent::DownloadComplete);
@@ -209,25 +217,42 @@ impl TabVoice {
 
                                 if let Ok(mut file) = file_result {
                                     let mut success = true;
-                                    while let Ok(Some(chunk)) = resp.chunk().await {
-                                        use std::io::Write;
-                                        if file.write_all(&chunk).is_err() {
-                                            success = false;
-                                            break;
-                                        }
-                                        downloaded += chunk.len() as f32;
-                                        if total > 0.0 {
-                                            let _ = tx.send(AppEvent::DownloadProgress { progress: downloaded / total });
+                                    loop {
+                                        match resp.chunk().await {
+                                            Ok(Some(chunk)) => {
+                                                use std::io::Write;
+                                                if file.write_all(&chunk).is_err() {
+                                                    success = false;
+                                                    break;
+                                                }
+                                                downloaded += chunk.len() as f32;
+                                                if total > 0.0 {
+                                                    let _ = tx.send(AppEvent::DownloadProgress { progress: downloaded / total });
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                success = false;
+                                                break;
+                                            }
                                         }
                                     }
                                     
                                     // Jika berhasil sampai akhir, rename!
                                     if success && (total == 0.0 || downloaded >= total) {
                                         let _ = std::fs::rename(&temp_path, &current_model_path);
+                                        let _ = tx.send(AppEvent::DownloadComplete);
+                                    } else {
+                                        let _ = tx.send(AppEvent::Error { message: "Koneksi terputus! Klik Save lagi untuk resume.".into() });
                                     }
+                                } else {
+                                    let _ = tx.send(AppEvent::Error { message: "Gagal membuat file temporary.".into() });
                                 }
+                            } else {
+                                let _ = tx.send(AppEvent::Error { message: "Gagal menghubungi server.".into() });
                             }
-                            let _ = tx.send(AppEvent::DownloadComplete);
                         });
                     });
                 }
@@ -252,6 +277,7 @@ impl TabVoice {
                 self.temp_dark_mode = current.dark_mode;
                 self.temp_realtime = current.realtime;
                 self.temp_auto_start = current.auto_start;
+                self.temp_memory_mode = current.memory_mode;
                 self.temp_vad_threshold = current.vad_threshold;
             }
             TrayAction::Quit => {
@@ -713,6 +739,22 @@ impl TabVoice {
                     ui.checkbox(&mut self.temp_realtime, "Live transcription (beta)");
                     ui.end_row();
 
+                    ui.label(egui::RichText::new("Memory Mode").color(text_color));
+                    let current_memory_name = match self.temp_memory_mode {
+                        crate::settings::MemoryMode::LoadOnStartup => "Load on Startup (Instan)",
+                        crate::settings::MemoryMode::LoadOnFirstUse => "Load on First Use (Hemat RAM)",
+                        crate::settings::MemoryMode::EcoMode => "Eco Mode (Auto-Unload)",
+                    };
+                    egui::ComboBox::from_id_source("memory_combo")
+                        .width(180.0)
+                        .selected_text(current_memory_name)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.temp_memory_mode, crate::settings::MemoryMode::LoadOnStartup, "Load on Startup (Instan)");
+                            ui.selectable_value(&mut self.temp_memory_mode, crate::settings::MemoryMode::LoadOnFirstUse, "Load on First Use (Hemat RAM)");
+                            ui.selectable_value(&mut self.temp_memory_mode, crate::settings::MemoryMode::EcoMode, "Eco Mode (Auto-Unload)");
+                        });
+                    ui.end_row();
+
                     ui.label("Anti-Hallucination:");
                     ui.add(egui::Slider::new(&mut self.temp_vad_threshold, 0.0..=0.05)
                         .text("Silence cutoff (VAD)")
@@ -742,6 +784,7 @@ impl TabVoice {
                             dark_mode: self.temp_dark_mode,
                             realtime: self.temp_realtime,
                             auto_start: self.temp_auto_start,
+                            memory_mode: self.temp_memory_mode,
                             vad_threshold: self.temp_vad_threshold,
                         };
 
