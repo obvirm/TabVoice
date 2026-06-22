@@ -709,6 +709,9 @@ impl TabVoice {
                         }
                         *self.state.settings.lock().unwrap() = new_settings;
                         self.mode = UiMode::Idle;
+                        
+                        // Otomatis trigger reload/download model yang baru disimpan!
+                        self.handle_tray(TrayAction::ReloadModel);
                     }
                     if ui.button("Cancel").clicked() {
                         self.mode = UiMode::Idle;
