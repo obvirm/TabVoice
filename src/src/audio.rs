@@ -294,13 +294,14 @@ where
                     &stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         let mono = mix_to_mono(data, channels);
-                        if let Ok(out) = res
-                            .lock()
-                            .expect("resampler mutex poisoned")
-                            .push(&mono)
-                        {
+                        let Ok(mut guard) = res.lock() else {
+                            log::error!("resampler mutex poisoned, skipping audio chunk");
+                            return;
+                        };
+                        if let Ok(out) = guard.push(&mono) {
                             if !out.is_empty() {
                                 let r = rms(&out);
+                                drop(guard);
                                 cb(out, r);
                             }
                         }
@@ -318,13 +319,14 @@ where
                     &stream_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         let mono = mix_to_mono(&i16_to_f32(data), channels);
-                        if let Ok(out) = res
-                            .lock()
-                            .expect("resampler mutex poisoned")
-                            .push(&mono)
-                        {
+                        let Ok(mut guard) = res.lock() else {
+                            log::error!("resampler mutex poisoned, skipping audio chunk");
+                            return;
+                        };
+                        if let Ok(out) = guard.push(&mono) {
                             if !out.is_empty() {
                                 let r = rms(&out);
+                                drop(guard);
                                 cb(out, r);
                             }
                         }

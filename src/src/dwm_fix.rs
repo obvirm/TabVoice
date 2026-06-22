@@ -1,5 +1,5 @@
 //! Disable DWM (Desktop Window Manager) rounded corner + drop shadow untuk
-//! window iced.
+//! window iced, dan secara periodik memastikan window flags tetap benar.
 //!
 //! Latar belakang: di Windows 11, semua window borderless (`decorations: false`)
 //! yang dibuat oleh winit akan di-render dengan rounded corner mask + drop shadow
@@ -12,9 +12,10 @@
 //! - `DWMWA_NCRENDERING_POLICY = 2` -> `DWMNCRP_DISABLED = 1` (non-client
 //!   rendering OFF, yang juga drop drop shadow DWM)
 //!
-//! Catatan: HWND iced window tidak di-expose secara publik. Cara ini pakai
-//! `EnumWindows` + `GetWindowThreadProcessId` matching ke PID kita untuk
-//! menemukan HWND. Aman karena hanya window dengan PID kita yang match.
+//! Selain itu, secara periodik re-apply:
+//! - `WS_EX_TOOLWINDOW` agar tidak muncul di taskbar
+//! - `WS_EX_TOPMOST` via `SetWindowPos(HWND_TOPMOST)` agar selalu di atas
+//! - `WS_EX_NOACTIVATE` agar tidak mencuri focus
 //!
 //! Reference: https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
 
@@ -32,7 +33,10 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::System::Threading::GetCurrentProcessId;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
+    SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST,
 };
 
 #[cfg(windows)]
@@ -72,11 +76,11 @@ unsafe fn find_our_hwnd() -> Option<HWND> {
     }
 }
 
-/// Disable DWM rounded corner + drop shadow untuk window current process.
-/// Idempotent — kedua kali call akan no-op.
+/// Disable DWM rounded corner + drop shadow untuk window current process,
+/// dan spawn background thread yang secara periodik memastikan window flags
+/// (always-on-top, no-taskbar, no-activate) tetap benar.
 ///
-/// Harus dipanggil SETELAH window dibuat dan visible. Recommended: spawn thread
-/// terpisah yang retry setiap 100ms sampai window found, max 5 detik.
+/// Harus dipanggil SETELAH window dibuat dan visible.
 #[cfg(windows)]
 pub fn disable_dwm_effects() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -84,15 +88,31 @@ pub fn disable_dwm_effects() {
         std::thread::Builder::new()
             .name("dwm-fix".to_string())
             .spawn(|| {
-                // Retry sampai window visible (max 5 detik).
+                // Fase 1: Retry sampai window visible (max 5 detik).
+                let mut hwnd_found = None;
                 for _ in 0..50 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     if let Some(hwnd) = unsafe { find_our_hwnd() } {
-                        apply(hwnd);
-                        return;
+                        apply_dwm(hwnd);
+                        apply_window_flags(hwnd);
+                        hwnd_found = Some(hwnd);
+                        break;
                     }
                 }
-                log::warn!("dwm_fix: window HWND not found dalam 5 detik, skip");
+
+                let Some(hwnd) = hwnd_found else {
+                    log::warn!("dwm_fix: window HWND not found dalam 5 detik, skip");
+                    return;
+                };
+
+                // Fase 2: Periodik re-apply setiap 3 detik.
+                // Ini memastikan kalau Windows mereset style (misalnya karena
+                // DPI change, monitor reconnect, Windows update, dll),
+                // pill tetap always-on-top dan tidak muncul di taskbar.
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    apply_window_flags(hwnd);
+                }
             })
             .expect("gagal spawn dwm-fix thread");
     });
@@ -104,9 +124,9 @@ pub fn disable_dwm_effects() {
 }
 
 #[cfg(windows)]
-fn apply(hwnd: HWND) {
+fn apply_dwm(hwnd: HWND) {
     unsafe {
-        // 1. Disable rounded corner: set DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND.
+        // Disable rounded corner: set DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND.
         let corner_pref: i32 = DWMWCP_DONOTROUND.0;
         let res1 = DwmSetWindowAttribute(
             hwnd,
@@ -117,6 +137,36 @@ fn apply(hwnd: HWND) {
         match res1 {
             Ok(()) => log::info!("DWM rounded corner disabled"),
             Err(e) => log::warn!("DWM rounded corner disable gagal: {e}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn apply_window_flags(hwnd: HWND) {
+    unsafe {
+        // Baca extended style saat ini
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+        // Tambahkan WS_EX_TOOLWINDOW (hide from taskbar) dan WS_EX_NOACTIVATE
+        let desired = ex_style
+            | WS_EX_TOOLWINDOW.0
+            | WS_EX_NOACTIVATE.0;
+
+        if ex_style != desired {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, desired as i32);
+            log::debug!("Re-applied WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE");
+        }
+
+        // Re-apply HWND_TOPMOST (always on top)
+        // Ini idempotent -- SetWindowPos dengan HWND_TOPMOST tidak menyebabkan flicker
+        if ex_style & WS_EX_TOPMOST.0 == 0 {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            log::debug!("Re-applied HWND_TOPMOST");
         }
     }
 }

@@ -191,10 +191,13 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
             // Append samples ke recorder.samples (lock brief).
             let mut emit_partial = None;
             {
-                let mut rec = state_cb.recorder.lock().unwrap();
+                let Ok(mut rec) = state_cb.recorder.lock() else {
+                    log::error!("recorder mutex poisoned in audio callback");
+                    return;
+                };
                 rec.samples.extend(samples);
 
-                let is_realtime = state_cb.settings.lock().unwrap().realtime;
+                let is_realtime = state_cb.settings.lock().map(|s| s.realtime).unwrap_or(false);
                 if is_realtime {
                     let len = rec.samples.len();
                     // 1600 samples pada 16kHz = 100 ms
@@ -205,8 +208,10 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
                 }
             }
             if let Some(partial_samples) = emit_partial {
-                if let Some(tx) = state_cb.release_tx.lock().unwrap().as_ref() {
-                    let _ = tx.send(crate::transcriber::TranscriberInput::Partial(partial_samples));
+                if let Ok(guard) = state_cb.release_tx.lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(crate::transcriber::TranscriberInput::Partial(partial_samples));
+                    }
                 }
             }
             // Emit Amplitude event untuk UI waveform.
