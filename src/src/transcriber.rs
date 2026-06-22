@@ -50,7 +50,7 @@ impl Transcriber {
         if let Some(m) = m_opt {
             m.transcribe(audio, &opts)
         } else {
-            Err(WhisperError::Generic("Model not loaded".into()))
+            Err(WhisperError::InitFailed)
         }
     }
 
@@ -140,7 +140,7 @@ impl Transcriber {
                 if let Some(current_model) = m_opt {
                     current_model
                 } else {
-                    let _ = event_tx.send(AppEvent::Partial {
+                    let _ = event_tx.send(AppEvent::TranscriptionPartial {
                         text: "Memuat model ke RAM...".into(),
                     });
                     
