@@ -5,7 +5,8 @@ Leave behind the fatigue of manual typing. **TabVoice** is an AI-powered voice t
 Built in **Rust** for ultra-lightweight, zero-bloat performance and powered by the Whisper AI model (with GPU acceleration support), TabVoice is designed to multiply your productivity when replying to emails, writing long documents, or capturing instant ideas.
 
 ### Video Showcase
-<video src="https://github.com/obvirm/TabVoice/raw/master/media/showcase.mp4" controls="controls" width="100%"></video>
+
+https://github.com/obvirm/TabVoice/raw/master/media/showcase.mp4
 
 ![TabVoice Showcase](media/ss.png)
 
