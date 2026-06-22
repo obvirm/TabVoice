@@ -1,6 +1,8 @@
 # TabVoice
 
-TabVoice adalah aplikasi *Push-to-Talk* (PTT) pintar lintas platform berbasis *Global Hotkey* untuk merekam suara dan mengubahnya menjadi teks menggunakan model **Whisper** secara lokal (GPU-accelerated), lalu menempelkan (*auto-paste*) teks tersebut langsung ke jendela aplikasi yang sedang aktif.
+Tinggalkan kebiasaan mengetik yang melelahkan. **TabVoice** adalah asisten pengetikan suara bertenaga AI yang jauh lebih mulus, lebih cepat, dan 100% berjalan secara lokal di perangkat Anda. Cukup tahan satu tombol dari aplikasi manapun, berbicaralah secara natural, dan saksikan ucapan Anda diketik dengan akurasi luar biasa dalam hitungan detik—tanpa perlu berlangganan layanan *cloud*, tanpa mengorbankan privasi, dan tanpa hambatan yang mengganggu.
+
+Dibangun dengan **Rust** untuk performa *zero-bloat* yang sangat ringan dan ditenagai oleh model AI Whisper (mendukung akselerasi GPU), TabVoice dirancang untuk meningkatkan produktivitas Anda hingga berkali-kali lipat dalam membalas pesan, menulis dokumen panjang, atau memasukkan ide secara instan.
 
 ### Video Showcase
 <video src="https://github.com/obvirm/TabVoice/raw/master/media/showcase.mp4" controls="controls" width="100%"></video>
