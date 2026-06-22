@@ -1,72 +1,72 @@
 # TabVoice
 
-Tinggalkan kebiasaan mengetik yang melelahkan. **TabVoice** adalah asisten pengetikan suara bertenaga AI yang jauh lebih mulus, lebih cepat, dan 100% berjalan secara lokal di perangkat Anda. Cukup tahan satu tombol dari aplikasi manapun, berbicaralah secara natural, dan saksikan ucapan Anda diketik dengan akurasi luar biasa dalam hitungan detik—tanpa perlu berlangganan layanan *cloud*, tanpa mengorbankan privasi, dan tanpa hambatan yang mengganggu.
+Leave behind the fatigue of manual typing. **TabVoice** is an AI-powered voice typing assistant that is smoother, faster, and runs 100% locally on your device. Simply hold a single hotkey from any application, speak naturally, and watch your words typed out with incredible accuracy in seconds—no cloud subscriptions, no privacy compromises, and no annoying delays.
 
-Dibangun dengan **Rust** untuk performa *zero-bloat* yang sangat ringan dan ditenagai oleh model AI Whisper (mendukung akselerasi GPU), TabVoice dirancang untuk meningkatkan produktivitas Anda hingga berkali-kali lipat dalam membalas pesan, menulis dokumen panjang, atau memasukkan ide secara instan.
+Built in **Rust** for ultra-lightweight, zero-bloat performance and powered by the Whisper AI model (with GPU acceleration support), TabVoice is designed to multiply your productivity when replying to emails, writing long documents, or capturing instant ideas.
 
 ### Video Showcase
 <video src="https://github.com/obvirm/TabVoice/raw/master/media/showcase.mp4" controls="controls" width="100%"></video>
 
 ![TabVoice Showcase](media/ss.png)
 
-*Antarmuka TabVoice yang minimalis, siap mendengarkan suara Anda.*
+*A minimalist interface, always ready to listen to your voice.*
 
-## Fitur Unggulan
+## Key Features
 
-- **Push-to-Talk (Global)**: Tekan dan tahan tombol `F4` dari aplikasi manapun untuk mulai merekam.
-- **Auto-Paste**: Hasil transkripsi akan otomatis ditempel (*paste*) ke kolom input yang sedang aktif.
-- **Model Mandiri (Self-Contained)**: Model AI *Whisper Base* berukuran 74MB sudah di-*embed* langsung ke dalam aplikasi. Tidak ada unduhan tambahan atau file ekstrak yang terpisah! *Plug-and-play*.
-- **Ikon Profesional**: Dilengkapi ikon kustom (*branding*) untuk antarmuka pengguna, *Taskbar* Windows, serta *Dock* macOS dan Linux.
-- **UI Minimalis & Modern**: Antarmuka transparan dan melayang (floating) yang tidak mengganggu pekerjaan Anda.
+- **Global Push-to-Talk**: Press and hold the configured hotkey from anywhere to start recording.
+- **Auto-Paste**: The transcribed text is automatically pasted into your active input field.
+- **Self-Contained Model**: The 74MB *Whisper Base* AI model is embedded directly into the executable. No additional downloads or external extractions required! *Plug-and-play*.
+- **Professional Branding**: Features a custom icon for the user interface, Windows Taskbar, and macOS/Linux Docks.
+- **Minimalist & Modern UI**: A transparent, floating interface that stays out of your way while you work.
 
-## Cara Instalasi
+## Installation
 
-Aplikasi ini bersifat **Plug-and-Play**. Anda tidak perlu mengunduh file model secara terpisah. Cukup jalankan file *executable*.
+This application is truly **Plug-and-Play**. You do not need to download model files separately. Just run the executable.
 
-### Untuk Pengguna (Windows)
+### For Users (Windows)
 
-1. Unduh `tabvoice.exe`.
-2. Jalankan `tabvoice.exe`. Anda bisa langsung menggunakan tombol `F4` untuk bicara.
+1. Download `tabvoice.exe`.
+2. Run `tabvoice.exe`. You can immediately use the default hotkey to start speaking.
 
-### Build dari Source Code (Cross-Platform)
+### Build from Source (Cross-Platform)
 
-TabVoice dapat di-*build* untuk **Windows, macOS, dan Linux**:
+TabVoice can be built for **Windows, macOS, and Linux**:
 
 ```bash
 cargo build --release
 ```
 
-*Catatan: Pastikan sistem Anda telah terpasang compiler C++ dan CMake untuk mengompilasi library backend.*
+*Note: Make sure your system has a C++ compiler and CMake installed to compile the backend library.*
 
 ---
 
-## Cara Penggunaan
+## How to Use
 
-1. **Jalankan Aplikasi:** Buka `tabvoice.exe` (atau jalankan via `cargo run --release`). 
-2. **Pilih Model & Bahasa:** Saat dijalankan, aplikasi akan menampilkan antarmuka utama. Anda juga bisa mengklik kanan ikon TabVoice di *System Tray* (pojok layar), lalu pilih **Settings**. Pilih model yang diinginkan (contoh: *Base* atau *Turbo*) dan bahasa pengenalan yang Anda mau (didukung oleh pustaka Whisper asli).
-3. **Mulai Berbicara:** Pindahkan fokus ke *text editor*, aplikasi *chat*, atau kolom teks apa saja. Tahan tombol `Ctrl + Shift + Space` dan mulailah berbicara.
-4. **Paste Teks:** Setelah selesai bicara, lepas tombol tersebut. Teks akan segera ditranskrip dan otomatis diketikkan di tempat kursor Anda berada!
+1. **Launch the App:** Open `tabvoice.exe` (or run via `cargo run --release`). 
+2. **Select Model & Language:** Upon launch, the main interface will appear. You can also right-click the TabVoice icon in the System Tray, then select **Settings**. Choose your preferred model (e.g., *Base* or *Turbo*) and recognition language (powered by the original Whisper library).
+3. **Start Speaking:** Focus on any text editor, chat app, or text field. Hold `Ctrl + Shift + Space` (or your configured hotkey) and start speaking.
+4. **Paste Text:** Release the key when you're done. Your speech will be transcribed and automatically typed exactly where your cursor is!
 
 ---
 
-## Persyaratan Sistem
+## System Requirements
 
-* **OS:** Windows 10/11, macOS, atau Linux.
-* **Perangkat Keras:** GPU NVIDIA (direkomendasikan untuk akselerasi CUDA) atau Apple Silicon untuk performa maksimal.
-* **Dependensi Build (Bagi Pengembang):**
+* **OS:** Windows 10/11, macOS, or Linux.
+* **Hardware:** NVIDIA GPU (recommended for CUDA acceleration) or Apple Silicon for maximum performance.
+* **Build Dependencies (For Developers):**
   * Rust (1.77+)
-  * CMake & C++ Build Tools (Visual Studio Build Tools untuk Windows, Clang untuk macOS/Linux).
+  * CMake & C++ Build Tools (Visual Studio Build Tools for Windows, Clang for macOS/Linux).
 
-## Pengembangan & Arsitektur
+## Architecture & Development
 
-Aplikasi ini dikembangkan menggunakan **Rust** dengan pendekatan arsitektur berperforma tinggi (*Low-Latency* & *Zero-Bloat*):
+This application is developed in **Rust** using a high-performance (*Low-Latency* & *Zero-Bloat*) architectural approach:
 
-* `egui` & `eframe` — Render antarmuka yang sangat responsif.
-* `whisper-cpp` & FFI — Pemanggilan C-bindings (FFI) asli ke *whisper.cpp* untuk inferensi lokal, memastikan penggunaan memori yang efisien.
-* `global-hotkey` — Pendeteksian pintasan *Push-to-Talk* global.
-* `cpal` & `rubato` — Pengambilan dan _resampling_ audio mikrofon *real-time*.
-* `reqwest` & `tokio` — Pengunduhan model secara asinkron (*non-blocking*).
-* Ekosistem Lintas Platform — Menggunakan API asli (`windows-rs` untuk Win32) dan pustaka standar lintas platform (`enigo` dan `tray-icon`) di Linux/macOS.
+* `egui` & `eframe` — Highly responsive user interface rendering.
+* `whisper-cpp` & FFI — Native C-bindings (FFI) to *whisper.cpp* for local inference, ensuring highly efficient memory usage.
+* `global-hotkey` — Global Push-to-Talk shortcut detection.
+* `cpal` & `rubato` — Real-time microphone audio capture and resampling.
+* `reqwest` & `tokio` — Asynchronous (non-blocking) model downloading.
+* Cross-Platform Ecosystem — Utilizes native APIs (`windows-rs` for Win32) and cross-platform standard libraries (`enigo` and `tray-icon`) on Linux/macOS.
 
 ---
-**TabVoice** dikerjakan untuk memberikan pengalaman mendikte semulus mungkin tanpa mengorbankan privasi data Anda. Cukup tahan spasi, bicara, dan biarkan AI yang mengetik!
+**TabVoice** was created to provide the smoothest dictation experience without compromising your data privacy. Just hold the hotkey, speak, and let the AI do the typing!
