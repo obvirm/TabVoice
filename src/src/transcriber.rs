@@ -1,4 +1,4 @@
-//! Wrapper di sekitar `oxiwhisper::WhisperModel` + tokio worker loop.
+//! Wrapper di sekitar `crate::ffi::WhisperModel` (whisper.cpp FFI) + tokio worker loop.
 //!
 //! Worker baca dari `tokio::sync::mpsc::UnboundedReceiver<Vec<f32>>` (samples
 //! 16 kHz mono f32), jalankan inference CPU-bound di `tokio::task::spawn_blocking`,
@@ -8,13 +8,21 @@
 
 use std::sync::Arc;
 
-use oxiwhisper::{OxiWhisperError, TranscribeOptions, WhisperModel};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::events::{AppEvent, EventSender};
+use crate::ffi::{WhisperError, WhisperModel, WhisperOptions};
 
 /// Ambang minimal durasi audio (samples @16 kHz mono). 0.3 detik = 4800 samples.
 const MIN_SAMPLES: usize = 4_800;
+
+/// Input untuk Transcriber: Parsial atau Final.
+pub enum TranscriberInput {
+    /// Data audio sementara saat recording (untuk visualisasi).
+    Partial(Vec<f32>),
+    /// Data audio final saat hotkey dilepas (untuk ditranskrip).
+    Final(Vec<f32>),
+}
 
 /// Wrapper tipis di atas `WhisperModel` agar bisa di-share `Arc` ke worker thread.
 pub struct Transcriber {
@@ -22,22 +30,24 @@ pub struct Transcriber {
     model: Arc<WhisperModel>,
     /// BCP-47 language hint (mis. `"en"`, `"id"`). `None` = auto-detect.
     language: Option<String>,
+    /// State aplikasi untuk setting realtime & paste
+    state: Arc<crate::state::AppState>,
 }
 
 impl Transcriber {
     /// Buat `Transcriber` baru. `model` biasanya di-load sekali di startup dan
     /// di-share `Arc` ke worker + UI (untuk `info()`).
-    pub fn new(model: Arc<WhisperModel>, language: Option<String>) -> Self {
-        Self { model, language }
+    pub fn new(model: Arc<WhisperModel>, language: Option<String>, state: Arc<crate::state::AppState>) -> Self {
+        Self { model, language, state }
     }
 
     /// Jalankan inference langsung tanpa spawn ke blocking thread.
     /// Berguna untuk unit test atau pemanggilan sync.
-    pub fn transcribe_blocking(&self, audio: &[f32]) -> Result<String, OxiWhisperError> {
-        let opts = TranscribeOptions {
-            language: self.language.as_deref(),
-            no_repeat_ngram_size: 4,
-            ..TranscribeOptions::default()
+    pub fn transcribe_blocking(&self, audio: &[f32]) -> Result<String, WhisperError> {
+        let opts = WhisperOptions {
+            language: self.language.clone(),
+            timestamps: false,
+            ..WhisperOptions::default()
         };
         self.model.transcribe(audio, &opts)
     }
@@ -48,7 +58,7 @@ impl Transcriber {
     /// Inference berjalan di `spawn_blocking` agar tidak block runtime tokio.
     pub async fn run_loop(
         self,
-        mut release_rx: UnboundedReceiver<Vec<f32>>,
+        mut release_rx: UnboundedReceiver<TranscriberInput>,
         event_tx: EventSender,
     ) {
         log::info!(
@@ -56,74 +66,228 @@ impl Transcriber {
             self.language
         );
 
-        while let Some(samples) = release_rx.recv().await {
+        while let Some(mut input) = release_rx.recv().await {
+            // Kuras antrean: ambil chunk paling baru.
+            // Jika ada `Final` di antrean, prioritaskan `Final` dan abaikan `Partial` sebelumnya.
+            while let Ok(next_input) = release_rx.try_recv() {
+                match next_input {
+                    TranscriberInput::Final(s) => {
+                        input = TranscriberInput::Final(s);
+                        // Jangan kuras lagi kalau sudah ketemu Final
+                        break;
+                    }
+                    TranscriberInput::Partial(s) => {
+                        // Update input ke Partial yang paling baru,
+                        // asalkan kita belum memegang Final.
+                        if let TranscriberInput::Partial(_) = input {
+                            input = TranscriberInput::Partial(s);
+                        }
+                    }
+                }
+            }
+
+            let (samples, is_partial) = match input {
+                TranscriberInput::Partial(s) => (s, true),
+                TranscriberInput::Final(s) => (s, false),
+            };
+
             // Skip audio terlalu pendek — kemungkinan noise / tidak ada speech.
             if samples.len() < MIN_SAMPLES {
-                log::debug!(
-                    "Skipping short audio chunk: {} samples (< {} = 0.3s)",
-                    samples.len(),
-                    MIN_SAMPLES
-                );
-                let _ = event_tx.send(AppEvent::Error {
-                    message: "No speech detected".into(),
-                });
+                if !is_partial {
+                    log::debug!(
+                        "Skipping short audio chunk: {} samples (< {} = 0.3s)",
+                        samples.len(),
+                        MIN_SAMPLES
+                    );
+                    let _ = event_tx.send(AppEvent::Error {
+                        message: "No speech detected".into(),
+                    });
+                }
                 continue;
             }
 
-            // Clone handle ke model & language untuk dipindahkan ke blocking task.
-            let model = Arc::clone(&self.model);
+            // Ambil model dari state jika ada (misal setelah reload), jika tidak fallback ke self.model
+            let model = {
+                let m = self.state.model.lock().unwrap();
+                if let Some(ref current_model) = *m {
+                    std::sync::Arc::clone(current_model)
+                } else {
+                    std::sync::Arc::clone(&self.model)
+                }
+            };
             let lang = self.language.clone();
             let sample_count = samples.len();
 
-            log::info!("Transcribing {sample_count} samples (~{:.2}s)", sample_count as f32 / 16_000.0);
+            let vad_threshold = self.state.settings.lock().unwrap().vad_threshold;
+
+            // Sederhana: Hitung RMS (Root Mean Square) volume untuk VAD (Voice Activity Detection)
+            // Untuk realtime (partial), kita hanya cek 1 detik terakhir. 
+            // Jika user diam, kita tidak ingin RMS dari awal kalimat membuat VAD tetap lolos (yang memicu halusinasi spasi).
+            let vad_samples = if is_partial && sample_count > 16_000 {
+                &samples[sample_count - 16_000..]
+            } else {
+                &samples[..]
+            };
+            
+            let sum_sq: f32 = vad_samples.iter().map(|&s| s * s).sum();
+            let rms = (sum_sq / vad_samples.len() as f32).sqrt();
+
+            // Jika sangat hening, abaikan langsung, jangan teruskan ke Whisper!
+            // Ini untuk mencegah "halusinasi dari keheningan".
+            if rms < vad_threshold {
+                log::info!("Audio too quiet (RMS: {:.4} < {:.4}), skipping to prevent hallucination", rms, vad_threshold);
+                if !is_partial {
+                    let _ = event_tx.send(AppEvent::Error {
+                        message: "No speech detected (Too quiet)".into(),
+                    });
+                }
+                continue;
+            }
+
+            log::info!(
+                "Transcribing {sample_count} samples (~{:.2}s) | RMS: {:.4}",
+                sample_count as f32 / 16_000.0,
+                rms
+            );
 
             // Inference CPU-bound: jalankan di thread pool blocking.
             let join_result = tokio::task::spawn_blocking(move || {
-                let opts = TranscribeOptions {
-                    language: lang.as_deref(),
-                    no_repeat_ngram_size: 4,
-                    ..TranscribeOptions::default()
+                let opts = WhisperOptions {
+                    language: lang,
+                    timestamps: false,
+                    // LAYER ANTI-HALUSINASI TAMBAHAN: Initial Prompt
+                    // Memberikan konteks pada Whisper agar ia "fokus" pada transkripsi yang rapi
+                    // dan tidak berhalusinasi mengucapkan frasa "subtitle YouTube"
+                    initial_prompt: Some("Berikut ini adalah rekaman suara yang diucapkan dengan jelas dan ditranskripsi tanpa pengulangan kata atau kalimat acak.".to_string()),
+                    ..WhisperOptions::default()
                 };
-                model.transcribe(&samples, &opts)
+                model.transcribe_full(&samples, &opts)
             })
             .await;
 
-             match join_result {
-                Ok(Ok(text)) => {
-                    let cleaned = clean_non_speech_tokens(&text);
+            match join_result {
+                Ok(Ok(result)) => {
+                    let cleaned = clean_non_speech_tokens(&result.text);
                     if cleaned.is_empty() {
                         log::info!("Transcription returned empty text after cleaning non-speech tokens");
                         continue;
                     }
 
                     if is_hallucination(&cleaned) {
-                        log::warn!("Hallucination/repetition detected: {:?}", cleaned);
-                        let _ = event_tx.send(AppEvent::Error {
-                            message: "Noise/repetition detected, please try again".into(),
-                        });
+                        if !is_partial {
+                            log::warn!("Hallucination/repetition detected: {:?}", cleaned);
+                            let _ = event_tx.send(AppEvent::Error {
+                                message: "Noise/repetition detected, please try again".into(),
+                            });
+                        }
                         continue;
                     }
 
-                    log::info!("Transcription OK ({} chars): {cleaned:?}", cleaned.len());
-                    // Paste ke active window (clipboard + SendInput Ctrl+V).
-                    // Error di-log tapi tidak menggagalkan emit Done — teks
-                    // minimal sudah masuk clipboard.
-                    if let Err(e) = crate::paste::paste_text(&cleaned) {
-                        log::warn!("paste_text failed (text tetap di clipboard): {e}");
+                    // LAYER ANTI-HALUSINASI TAMBAHAN: Token Confidence
+                    let mut avg_confidence = 0.0;
+                    let mut valid_segments = 0;
+                    for seg in &result.segments {
+                        if !seg.is_hallucination {
+                            avg_confidence += seg.confidence;
+                            valid_segments += 1;
+                        }
                     }
-                    let _ = event_tx.send(AppEvent::Done { text: cleaned });
+                    if valid_segments > 0 {
+                        avg_confidence /= valid_segments as f32;
+                    }
+
+                    if valid_segments > 0 && avg_confidence < 0.40 {
+                        if !is_partial {
+                            log::warn!("Low confidence ({:.2}), likely hallucination: {:?}", avg_confidence, cleaned);
+                            let _ = event_tx.send(AppEvent::Error {
+                                message: "Low confidence (Unclear speech)".into(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    let (is_realtime, paste_on_release) = {
+                        let settings = self.state.settings.lock().unwrap();
+                        (settings.realtime, settings.paste_on_release)
+                    };
+
+                    if is_partial {
+                        log::info!(
+                            "Partial OK ({} chars): {cleaned:?}",
+                            cleaned.len()
+                        );
+                        if is_realtime && paste_on_release {
+                            let text_trimmed = cleaned.trim();
+                            let mut rec = self.state.recorder.lock().unwrap();
+                            if !text_trimmed.is_empty() {
+                                if text_trimmed.starts_with(&rec.pasted_partial_text) {
+                                    let diff = &text_trimmed[rec.pasted_partial_text.len()..];
+                                    if !diff.is_empty() {
+                                        let _ = crate::paste::paste_text(diff);
+                                    }
+                                } else {
+                                    let backspaces = rec.pasted_partial_text.encode_utf16().count();
+                                    if backspaces > 0 {
+                                        let _ = crate::paste::send_backspaces(backspaces);
+                                    }
+                                    let _ = crate::paste::paste_text(text_trimmed);
+                                }
+                                rec.pasted_partial_text = text_trimmed.to_string();
+                            }
+                        }
+                        let _ = event_tx.send(AppEvent::TranscriptionPartial { text: cleaned });
+                    } else {
+                        log::info!(
+                            "Transcription OK ({} chars): {cleaned:?}",
+                            cleaned.len()
+                        );
+                        if paste_on_release {
+                            let text_trimmed = cleaned.trim();
+                            let mut rec = self.state.recorder.lock().unwrap();
+                            if is_realtime && !rec.pasted_partial_text.is_empty() {
+                                if text_trimmed.starts_with(&rec.pasted_partial_text) {
+                                    let diff = &text_trimmed[rec.pasted_partial_text.len()..];
+                                    if !diff.is_empty() {
+                                        if let Err(e) = crate::paste::paste_text(diff) {
+                                            log::warn!("paste_text failed: {e}");
+                                        }
+                                    }
+                                } else {
+                                    let backspaces = rec.pasted_partial_text.encode_utf16().count();
+                                    if backspaces > 0 {
+                                        let _ = crate::paste::send_backspaces(backspaces);
+                                    }
+                                    if !text_trimmed.is_empty() {
+                                        if let Err(e) = crate::paste::paste_text(text_trimmed) {
+                                            log::warn!("paste_text failed: {e}");
+                                        }
+                                    }
+                                }
+                                rec.pasted_partial_text.clear();
+                            } else if !text_trimmed.is_empty() {
+                                if let Err(e) = crate::paste::paste_text(text_trimmed) {
+                                    log::warn!("paste_text failed: {e}");
+                                }
+                            }
+                        }
+                        let _ = event_tx.send(AppEvent::Done { text: cleaned });
+                    }
                 }
                 Ok(Err(e)) => {
                     log::error!("Transcribe error: {e}");
-                    let _ = event_tx.send(AppEvent::Error {
-                        message: format!("Transcribe failed: {e}"),
-                    });
+                    if !is_partial {
+                        let _ = event_tx.send(AppEvent::Error {
+                            message: format!("Transcribe failed: {e}"),
+                        });
+                    }
                 }
                 Err(join_err) => {
                     log::error!("spawn_blocking join error: {join_err}");
-                    let _ = event_tx.send(AppEvent::Error {
-                        message: "Inference task panicked".into(),
-                    });
+                    if !is_partial {
+                        let _ = event_tx.send(AppEvent::Error {
+                            message: "Inference task panicked".into(),
+                        });
+                    }
                 }
             }
         }
@@ -203,6 +367,44 @@ fn is_hallucination(text: &str) -> bool {
                 return true;
             }
         }
+    }
+
+    // 4. Frasa berulang (mis. "terima kasih banyak lagi bersama saya" berulang)
+    // Cek panjang frasa dari 2 kata sampai 10 kata.
+    for phrase_len in 2..=10 {
+        if words.len() >= phrase_len * 2 {
+            for i in 0..=(words.len() - phrase_len * 2) {
+                let phrase = &words[i..i + phrase_len];
+                let mut repeat_count = 1;
+                // Cek berapa kali frasa ini diulang berturut-turut
+                let mut next_idx = i + phrase_len;
+                while next_idx + phrase_len <= words.len() {
+                    let next_phrase = &words[next_idx..next_idx + phrase_len];
+                    if phrase.iter().zip(next_phrase.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+                        repeat_count += 1;
+                        next_idx += phrase_len;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Jika frasa panjang (>=4 kata) diulang 2x saja sudah aneh (halusinasi).
+                // Jika frasa pendek (2-3 kata), butuh minimal 3x ulang.
+                let required_repeats = if phrase_len >= 4 { 2 } else { 3 };
+                if repeat_count >= required_repeats {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 5. Hardcoded hallucinations yang sangat umum pada bahasa Indonesia
+    let lower_text = text.to_lowercase();
+    if lower_text.contains("terima kasih banyak") && lower_text.matches("terima kasih").count() >= 2 {
+        return true;
+    }
+    if lower_text.contains("jangan lupa subscribe") || lower_text.contains("sampai jumpa di video selanjutnya") {
+        return true;
     }
 
     false

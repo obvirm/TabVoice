@@ -105,11 +105,127 @@ pub fn send_paste() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+/// Kirim sejumlah backspace ke sistem (simulasi ketukan tombol).
+pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK, VK_LEFT, VK_SHIFT,
+    };
+
+    let mut inputs = Vec::with_capacity(count * 2 + 4);
+    
+    // Shift down
+    inputs.push(INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(VK_SHIFT.0),
+                wScan: 0,
+                dwFlags: KEYBD_EVENT_FLAGS(0),
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    });
+
+    // Left down/up N times
+    for _ in 0..count {
+        inputs.push(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(VK_LEFT.0),
+                    wScan: 0,
+                    dwFlags: KEYBD_EVENT_FLAGS(0),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        });
+        inputs.push(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(VK_LEFT.0),
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        });
+    }
+
+    // Shift up
+    inputs.push(INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(VK_SHIFT.0),
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    });
+    
+    // Backspace
+    inputs.push(INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(VK_BACK.0),
+                wScan: 0,
+                dwFlags: KEYBD_EVENT_FLAGS(0),
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    });
+    inputs.push(INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(VK_BACK.0),
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    });
+
+    let sent = unsafe {
+        SendInput(
+            &inputs,
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+
+    if sent as usize != inputs.len() {
+        anyhow::bail!("SendInput hanya mengirim {sent} dari {} events backspace", inputs.len());
+    }
+    
+    // Beri waktu OS untuk memproses event hapus sebelum kita kirim Ctrl+V
+    thread::sleep(Duration::from_millis(20));
+    Ok(())
+}
+
 /// Stub non-Windows: TabVoice target Windows, tapi sediakan stub agar
 /// `cargo check` di host non-Windows tidak fail.
 #[cfg(not(windows))]
 pub fn send_paste() -> anyhow::Result<()> {
     anyhow::bail!("send_paste hanya diimplementasi untuk Windows")
+}
+
+#[cfg(not(windows))]
+pub fn send_backspaces(_count: usize) -> anyhow::Result<()> {
+    anyhow::bail!("send_backspaces hanya diimplementasi untuk Windows")
 }
 
 /// Convenience: copy ke clipboard + sleep 30ms + kirim Ctrl+V.
@@ -123,11 +239,44 @@ pub fn paste_text(text: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    crate::focus::restore_focus();
+
     copy_to_clipboard(text).context("copy_to_clipboard gagal")?;
     thread::sleep(Duration::from_millis(30));
     send_paste().context("send_paste gagal")?;
 
     log::info!("Pasted {} chars", text.len());
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    use enigo::{Enigo, Keyboard, Key, Settings};
+    let mut enigo = Enigo::new(&Settings::default())?;
+    for _ in 0..count {
+        enigo.key(Key::Backspace, enigo::Direction::Click)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn send_paste() -> anyhow::Result<()> {
+    use enigo::{Enigo, Keyboard, Key, Settings};
+    let mut enigo = Enigo::new(&Settings::default())?;
+    
+    // Ctrl+V for Linux, Cmd+V for macOS
+    #[cfg(target_os = "macos")]
+    let modifier = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = Key::Control;
+    
+    enigo.key(modifier, enigo::Direction::Press)?;
+    enigo.key(Key::Unicode('v'), enigo::Direction::Click)?;
+    enigo.key(modifier, enigo::Direction::Release)?;
+    
     Ok(())
 }
 

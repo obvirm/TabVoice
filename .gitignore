@@ -17,3 +17,5 @@ Thumbs.db
 # Whisper model binaries (downloaded separately, not in git)
 models/*.bin
 models/*.gguf
+**/models/*.bin
+**/models/*.gguf

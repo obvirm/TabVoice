@@ -231,6 +231,7 @@ impl MicCapture {
 pub fn start_capture<F>(
     device_sample_rate: u32,
     device_channels: u16,
+    device_name: Option<&str>,
     on_samples: F,
 ) -> Result<MicCapture>
 where
@@ -239,9 +240,19 @@ where
     let host = cpal::default_host();
     log::info!("Audio host backend: {:?}", host.id());
 
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("Tidak ada default input device (microphone)"))?;
+    let device = if let Some(name) = device_name {
+        host.input_devices()
+            .context("Gagal enumerasi input devices")?
+            .find(|d| d.name().unwrap_or_default() == name)
+            .or_else(|| {
+                log::warn!("Device '{}' tidak ditemukan, fallback ke default", name);
+                host.default_input_device()
+            })
+            .ok_or_else(|| anyhow::anyhow!("Tidak ada input device yang tersedia"))?
+    } else {
+        host.default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("Tidak ada default input device (microphone)"))?
+    };
     log::info!(
         "Input device: {}",
         device.name().unwrap_or_else(|_| "<unknown>".into())
@@ -360,4 +371,20 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
 /// Error callback untuk cpal stream — log aja, tidak propagate.
 fn stream_err_fn(err: cpal::StreamError) {
     log::error!("cpal stream error: {}", err);
+}
+
+/// Ambil daftar nama microphone yang tersedia di system
+pub fn get_available_microphones() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            if let Ok(name) = device.name() {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
 }

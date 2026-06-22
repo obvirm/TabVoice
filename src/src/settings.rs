@@ -35,15 +35,52 @@ pub struct Settings {
     /// Kalau `true`: paste otomatis ke window aktif saat hotkey dilepas.
     /// Kalau `false`: hanya salin ke clipboard.
     pub paste_on_release: bool,
+
+    /// Nama microphone yang dipilih (opsional).
+    /// `None` = pakai default system.
+    pub device_name: Option<String>,
+
+    /// Apakah menggunakan tema gelap.
+    pub dark_mode: bool,
+
+    /// Apakah menggunakan mode realtime transcription.
+    pub realtime: bool,
+
+    /// Apakah TabVoice dijalankan otomatis saat Windows menyala.
+    #[serde(default)]
+    pub auto_start: bool,
+
+    /// Ambang batas RMS untuk Voice Activity Detection.
+    /// Nilai default: 0.005. Jika suara lebih rendah dari ini, akan diabaikan (mencegah halusinasi).
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+}
+
+fn default_vad_threshold() -> f32 {
+    0.005
+}
+
+/// Mendapatkan absolute path ke folder `models/` di direktori yang sama dengan executable.
+pub fn get_models_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("models")
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("models/ggml-base.bin"),
+            model_path: get_models_dir().join("ggml-base.bin"),
             language: None,
             hotkey: "Ctrl+Shift+Space".to_string(),
             paste_on_release: true,
+            device_name: None,
+            dark_mode: true, // Default to dark mode since user asked for it
+            realtime: false,
+            auto_start: false,
+            vad_threshold: default_vad_threshold(),
         }
     }
 }
@@ -91,7 +128,7 @@ pub fn load_or_default() -> Settings {
         }
     };
 
-    match toml::from_str::<Settings>(&raw) {
+    let mut loaded = match toml::from_str::<Settings>(&raw) {
         Ok(s) => {
             log::info!("Loaded settings from {}", path.display());
             s
@@ -103,7 +140,18 @@ pub fn load_or_default() -> Settings {
             );
             Settings::default()
         }
+    };
+    
+    // Pastikan `model_path` selalu menggunakan folder `models/` di dekat exe.
+    // Jika user punya file lama dengan format "models/ggml-base.bin", kita 
+    // ambil nama filenya saja lalu satukan dengan `get_models_dir()`.
+    if let Some(file_name) = loaded.model_path.file_name() {
+        loaded.model_path = get_models_dir().join(file_name);
+    } else {
+        loaded.model_path = get_models_dir().join("ggml-base.bin");
     }
+    
+    loaded
 }
 
 /// Save settings ke disk. Create parent directory kalau belum ada.
@@ -115,7 +163,41 @@ pub fn save(s: &Settings) -> Result<()> {
     std::fs::write(&path, serialized)
         .with_context(|| format!("writing settings to {}", path.display()))?;
     log::info!("Saved settings to {}", path.display());
+    
+    // Apply auto_start to Windows Registry
+    apply_auto_start(s.auto_start);
+    
     Ok(())
+}
+
+/// Menambah atau menghapus TabVoice dari Windows Startup (Registry)
+pub fn apply_auto_start(enable: bool) {
+    let Ok(exe_path) = std::env::current_exe() else { return };
+    let exe_path_str = exe_path.display().to_string();
+    
+    if enable {
+        let _ = std::process::Command::new("reg")
+            .args([
+                "add",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v", "TabVoice",
+                "/t", "REG_SZ",
+                "/d", &exe_path_str,
+                "/f"
+            ])
+            .spawn();
+        log::info!("Registered to Windows Startup");
+    } else {
+        let _ = std::process::Command::new("reg")
+            .args([
+                "delete",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v", "TabVoice",
+                "/f"
+            ])
+            .spawn();
+        log::info!("Removed from Windows Startup");
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +213,9 @@ mod tests {
         assert_eq!(s.hotkey, parsed.hotkey);
         assert_eq!(s.paste_on_release, parsed.paste_on_release);
         assert_eq!(s.language, parsed.language);
+        assert_eq!(s.device_name, parsed.device_name);
+        assert_eq!(s.dark_mode, parsed.dark_mode);
+        assert_eq!(s.realtime, parsed.realtime);
     }
 
     #[test]

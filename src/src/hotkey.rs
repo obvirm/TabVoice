@@ -65,6 +65,7 @@ impl Drop for HotkeyHandle {
 /// closure butuh `Fn + Send + Sync`, sedangkan `std::sync::mpsc::Sender` hanya `Send`.
 /// Polling menghindari overhead `Arc<Mutex<Sender>>`.
 pub fn register_push_to_talk(
+    hotkey_str: &str,
     event_tx: EventSender,
     state: Arc<AppState>,
 ) -> Result<HotkeyHandle> {
@@ -78,11 +79,9 @@ pub fn register_push_to_talk(
         let manager = GlobalHotKeyManager::new()
             .context("Gagal membuat GlobalHotKeyManager")?;
 
-        // Chord default: Ctrl+Shift+Space.
-        let hotkey = HotKey::new(
-            Some(Modifiers::CONTROL | Modifiers::SHIFT),
-            Code::Space,
-        );
+        let hotkey = parse_hotkey_string(hotkey_str)
+            .ok_or_else(|| anyhow::anyhow!("Format hotkey tidak valid: {}", hotkey_str))?;
+        
         let hotkey_id = hotkey.id();
 
         manager
@@ -90,7 +89,8 @@ pub fn register_push_to_talk(
             .with_context(|| format!("Gagal mendaftarkan hotkey id={}", hotkey_id))?;
 
         log::info!(
-            "Hotkey terdaftar: Ctrl+Shift+Space (id={})",
+            "Hotkey terdaftar: {} (id={})",
+            hotkey_str,
             hotkey_id
         );
 
@@ -132,6 +132,11 @@ fn hotkey_listener_loop(hotkey_id: u32, event_tx: EventSender, state: Arc<AppSta
 
         match event.state {
             HotKeyState::Pressed => {
+                if crate::app::IS_ASSIGNING_HOTKEY.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = event_tx.send(AppEvent::ActiveHotkeyCaptured);
+                    continue;
+                }
+                crate::keyboard_hook::set_block_space(true);
                 handle_press(&event_tx, &state);
                 // Forward ke UI (untuk logging / indicator sekunder; UI utama
                 // di-drive oleh Amplitude events).
@@ -141,6 +146,10 @@ fn hotkey_listener_loop(hotkey_id: u32, event_tx: EventSender, state: Arc<AppSta
                 }
             }
             HotKeyState::Released => {
+                if crate::app::IS_ASSIGNING_HOTKEY.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                crate::keyboard_hook::set_block_space(false);
                 handle_release(&event_tx, &state);
                 if event_tx.send(AppEvent::HotkeyReleased).is_err() {
                     log::debug!("Channel AppEvent tutup saat release, hotkey listener keluar");
@@ -170,6 +179,8 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
         }
         rec.is_recording = true;
         rec.samples.clear();
+        rec.last_partial_len = 0;
+        rec.pasted_partial_text.clear();
     }
 
     // 2. Bangun callback yang capture event_tx & state (clone Arc).
@@ -178,9 +189,25 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
     let on_samples: Arc<dyn Fn(Vec<f32>, f32) + Send + Sync> =
         Arc::new(move |samples: Vec<f32>, rms: f32| {
             // Append samples ke recorder.samples (lock brief).
+            let mut emit_partial = None;
             {
                 let mut rec = state_cb.recorder.lock().unwrap();
                 rec.samples.extend(samples);
+
+                let is_realtime = state_cb.settings.lock().unwrap().realtime;
+                if is_realtime {
+                    let len = rec.samples.len();
+                    // 1600 samples pada 16kHz = 100 ms
+                    if len - rec.last_partial_len >= 1600 {
+                        rec.last_partial_len = len;
+                        emit_partial = Some(rec.samples.clone());
+                    }
+                }
+            }
+            if let Some(partial_samples) = emit_partial {
+                if let Some(tx) = state_cb.release_tx.lock().unwrap().as_ref() {
+                    let _ = tx.send(crate::transcriber::TranscriberInput::Partial(partial_samples));
+                }
             }
             // Emit Amplitude event untuk UI waveform.
             let _ = event_tx_cb.send(AppEvent::Amplitude { value: rms });
@@ -192,9 +219,11 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
     //    jadi hint ini cuma untuk logging.
     let (hint_rate, hint_channels) =
         detect_default_input_config().unwrap_or((48_000, 1));
+        
+    let device_name = state.settings.lock().unwrap().device_name.clone();
 
     // 4. Start MicCapture dengan callback wrapper.
-    let capture = match audio::start_capture(hint_rate, hint_channels, move |s, r| {
+    let capture = match audio::start_capture(hint_rate, hint_channels, device_name.as_deref(), move |s, r| {
         on_samples(s, r)
     }) {
         Ok(c) => c,
@@ -249,7 +278,7 @@ pub fn handle_release(event_tx: &EventSender, state: &Arc<AppState>) {
 
     // 3. Kirim ke transcriber worker kalau channel masih hidup.
     if let Some(tx) = state.release_tx.lock().unwrap().as_ref() {
-        if let Err(e) = tx.send(samples) {
+        if let Err(e) = tx.send(crate::transcriber::TranscriberInput::Final(samples)) {
             log::warn!("Gagal kirim samples ke release_tx (transcriber sudah drop?): {e}");
         }
     } else {

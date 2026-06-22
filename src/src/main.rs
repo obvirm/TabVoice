@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 //! Entry point untuk binary `tabvoice`.
 //!
 //! Phase 6 orchestration:
@@ -13,54 +15,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use iced::Task;
-use iced::application;
-use iced::window::{Level, Position, Settings as WindowSettings};
-use iced::Size;
+use eframe::egui;
 
-use tabvoice_lib::app::{self, AppFlags};
+use tabvoice_lib::app::{AppFlags, TabVoice};
 use tabvoice_lib::{events, hotkey, settings, state as app_state, transcriber, tray};
 
-/// Mengunduh model Whisper GGML otomatis dari HuggingFace menggunakan `curl` bawaan Windows.
-fn download_model(model_path: &std::path::Path) -> anyhow::Result<()> {
-    if let Some(parent) = model_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let model_name = model_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Nama file model tidak valid"))?;
-
-    let url = format!(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-        model_name
-    );
-
-    log::info!("Mengunduh model otomatis dari {} ke {}...", url, model_path.display());
-    println!("Mengunduh model Whisper ({}) otomatis. Harap tunggu...", model_name);
-
-    let status = std::process::Command::new("curl")
-        .arg("-L")
-        .arg("-o")
-        .arg(model_path)
-        .arg(&url)
-        .status()?;
-
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "Gagal mengunduh model via curl (exit code: {:?})",
-            status.code()
-        ));
-    }
-
-    log::info!("Model {} berhasil diunduh!", model_name);
-    Ok(())
-}
-
-fn main() -> iced::Result {
+fn main() -> eframe::Result<()> {
     // 1. Init logger (default level `info`, override via RUST_LOG).
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
@@ -71,34 +31,35 @@ fn main() -> iced::Result {
     let settings = settings::load_or_default();
     log::info!("Settings loaded: model={:?}", settings.model_path);
 
-    // Cek keberadaan model, jika belum ada unduh secara otomatis.
-    if !settings.model_path.exists() {
-        if let Err(e) = download_model(&settings.model_path) {
-            let msg = format!(
-                "Gagal mengunduh model otomatis ke {:?}: {e}",
-                settings.model_path
-            );
-            log::error!("{msg}");
-            eprintln!("Error: {msg}");
-            std::process::exit(1);
-        }
-    }
-
     // 3. Load WhisperModel (blocking, butuh ~detik untuk model besar).
-    //    Kalau gagal, exit dengan error friendly - tanpa model, transcriber
-    //    worker tidak bisa inference.
-    let model = match oxiwhisper::WhisperModel::from_file(&settings.model_path) {
+    //    Coba load dari path di settings dulu. Kalau gagal (misal baru pertama
+    //    kali launch dan belum download), pakai model embedded (ggml-base.bin).
+    const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
+
+    let model = match tabvoice_lib::ffi::WhisperModel::from_file(&settings.model_path) {
         Ok(m) => Arc::new(m),
         Err(e) => {
-            let msg = format!(
-                "Gagal load model {:?}: {e}. Pastikan file model ada di lokasi tersebut.",
+            log::warn!(
+                "Gagal load model dari file {:?}: {e}. Memuat model bawaan (embedded)...",
                 settings.model_path
             );
-            log::error!("{msg}");
-            eprintln!("Error: {msg}");
-            std::process::exit(1);
+            match tabvoice_lib::ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES) {
+                Ok(m) => Arc::new(m),
+                Err(e2) => {
+                    let msg = format!("Gagal memuat model bawaan (embedded): {e2}.");
+                    log::error!("{msg}");
+                    eprintln!("Error: {msg}");
+                    std::process::exit(1);
+                }
+            }
         }
     };
+
+    log::info!(
+        "WhisperModel loaded: type={}, multilingual={}",
+        model.model_type_readable(),
+        model.is_multilingual()
+    );
 
     // 4. Setup channels.
     //    - event_tx/rx: AppEvent antara background threads (audio, hotkey,
@@ -128,7 +89,7 @@ fn main() -> iced::Result {
     Box::leak(Box::new(rt));
 
     // 7. Spawn transcriber worker di tokio runtime.
-    let transcriber = transcriber::Transcriber::new(model, settings.language.clone());
+    let transcriber = transcriber::Transcriber::new(model, settings.language.clone(), Arc::clone(&app_state));
     let event_tx_for_transcriber = event_tx.clone();
     rt_handle.spawn(async move {
         transcriber.run_loop(release_rx, event_tx_for_transcriber).await;
@@ -136,37 +97,45 @@ fn main() -> iced::Result {
 
     // 8. Register global hotkey (Ctrl+Shift+Space) dan spawn listener thread.
     //    Listener butuh Arc<AppState> untuk start/stop MicCapture saat press/release.
-    let _hotkey_handle = hotkey::register_push_to_talk(event_tx.clone(), app_state.clone())
+    let _hotkey_handle = hotkey::register_push_to_talk(&settings.hotkey, event_tx.clone(), app_state.clone())
         .expect("Failed to register hotkey Ctrl+Shift+Space");
 
     // 9. Init system tray icon + context menu. Tray spawn thread sendiri
     //    untuk message loop `GetMessageW`.
     let _tray_handle = tray::init(event_tx.clone()).expect("Failed to init system tray");
 
-    // 10. Build AppFlags & launch iced UI. UI loop akan drain event_rx
-    //     di subscription Tick 60fps (lihat app::subscription).
+    // 10. Build AppFlags & launch egui UI.
     let flags = AppFlags {
         event_rx,
         event_tx: event_tx.clone(),
         state: app_state,
     };
 
-    log::info!("TabVoice startup complete - launching iced UI");
+    log::info!("TabVoice startup complete - launching egui UI");
 
-    application("TabVoice", app::update, app::view)
-        .subscription(app::subscription)
-        .style(|_state, _theme| iced::application::Appearance {
-            background_color: iced::Color::TRANSPARENT,
-            text_color: iced::Color::WHITE,
-        })
-        .window(WindowSettings {
-            size: Size::new(600.0, 80.0),
-            position: Position::Centered,
-            transparent: true,
-            decorations: false,
-            level: Level::AlwaysOnTop,
-            resizable: false,
-            ..Default::default()
-        })
-        .run_with(|| (app::TabVoice::new(flags), Task::none()))
+    // Install global keyboard hook to block Space during recording
+    tabvoice_lib::keyboard_hook::install_hook();
+
+    // Start background thread to constantly track the last active window
+    tabvoice_lib::focus::spawn_focus_tracker();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_inner_size([52.0, 52.0])
+            .with_resizable(false)
+            .with_taskbar(false),
+        ..Default::default()
+    };
+
+    // Spawn a thread to apply WS_EX_NOACTIVATE and disable DWM shadows once the window appears
+    tabvoice_lib::dwm_fix::disable_dwm_effects();
+
+    eframe::run_native(
+        "TabVoice",
+        options,
+        Box::new(|_cc| Box::new(TabVoice::new(flags))),
+    )
 }

@@ -6,10 +6,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use oxiwhisper::WhisperModel;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::audio::MicCapture;
+use crate::ffi::WhisperModel;
 use crate::settings::Settings;
 
 /// State internal recorder — di-share antara hotkey callback (yang set
@@ -23,6 +23,10 @@ pub struct RecorderState {
     /// Handle ke microphone capture aktif. `Some` saat recording, `None` saat idle.
     /// Drop = stop stream (lihat [`MicCapture::Drop`]).
     pub mic: Mutex<Option<MicCapture>>,
+    /// Panjang sampel terakhir yang dikirim untuk partial transcription.
+    pub last_partial_len: usize,
+    /// Teks parsial terakhir yang di-paste.
+    pub pasted_partial_text: String,
 }
 
 /// State bersama seluruh aplikasi.
@@ -38,7 +42,7 @@ pub struct AppState {
     /// State recorder (shared antara hotkey + audio callback).
     pub recorder: Mutex<RecorderState>,
     /// Sender ke transcriber worker. Di-set sekali saat startup, di-drop saat shutdown.
-    pub release_tx: Mutex<Option<UnboundedSender<Vec<f32>>>>,
+    pub release_tx: Mutex<Option<UnboundedSender<crate::transcriber::TranscriberInput>>>,
     /// Settings persistent (di-load dari disk di startup, di-save saat user edit).
     pub settings: Mutex<Settings>,
 }

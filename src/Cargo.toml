@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description.workspace = true
+build = "build.rs"
 
 [lib]
 name = "tabvoice_lib"
@@ -17,25 +18,32 @@ path = "src/main.rs"
 
 # Phase 1 dependencies (minimal — cukup untuk compile & buka window).
 # Phase 2 tambah: global-hotkey, anyhow, log (untuk hotkey listener & error handling).
-# Dependensi lain (cpal, rubato, arboard, oxiwhisper, windows)
+# Dependensi lain (cpal, rubato, arboard, windows)
 # akan ditambah di fase 3-6.
 
 [dependencies]
-iced = { workspace = true }
 global-hotkey = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 cpal = { workspace = true }
 rubato = { workspace = true }
 arboard = { workspace = true }
-oxiwhisper = { version = "0.1.1", features = ["timing"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 env_logger = { workspace = true }
+eframe = "0.27"
+egui = "0.27"
+reqwest = { version = "0.13.3", features = ["stream", "rustls"] }
+
+[build-dependencies]
+cmake = { workspace = true }
+bindgen = { workspace = true }
+winres = "0.1.12"
 
 # Windows-only: Win32 SendInput untuk auto-paste Ctrl+V
-# + Shell_NotifyIconW untuk system tray (Phase 6).
+# + Shell_NotifyIconW untuk system tray (Phase 6)
+# + DwmSetWindowAttribute untuk disable DWM rounded corner + drop shadow.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -44,6 +52,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+enigo = "0.2"
+tray-icon = "0.14"

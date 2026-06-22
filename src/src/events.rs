@@ -19,6 +19,8 @@ pub enum AppEvent {
     HotkeyPressed,
     /// Hotkey dilepas → stop recording.
     HotkeyReleased,
+    /// Hotkey aktif tertangkap saat UI mencoba assign hotkey baru
+    ActiveHotkeyCaptured,
     /// Aksi dari tray icon menu (Phase 6).
     TrayAction(TrayAction),
     /// Transkrip selesai (Phase 3+).
@@ -26,11 +28,22 @@ pub enum AppEvent {
         /// Teks hasil transkrip yang akan di-paste.
         text: String,
     },
+    /// Transkrip parsial (Real-Time).
+    TranscriptionPartial {
+        /// Teks hasil transkrip sementara.
+        text: String,
+    },
     /// Error recoverable — tampilkan toast / log.
     Error {
         /// Pesan error human-readable.
         message: String,
     },
+    /// Progress download model (0.0 - 1.0)
+    DownloadProgress {
+        progress: f32,
+    },
+    /// Download selesai
+    DownloadComplete,
 }
 
 /// Aksi yang dikirim dari system tray menu (Phase 6).
