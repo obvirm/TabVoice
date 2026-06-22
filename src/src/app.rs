@@ -491,8 +491,22 @@ impl TabVoice {
             })
         });
 
+        let (model_name, is_loaded) = {
+            let settings = self.state.settings.lock().unwrap();
+            let name = settings.model_path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown").to_string();
+            let loaded = self.state.model.lock().unwrap().is_some();
+            (name, loaded)
+        };
+        let tooltip = if is_loaded {
+            format!("Model: {} (Aktif)", model_name)
+        } else {
+            format!("Model: {} (Standby)", model_name)
+        };
+        
+        let pill_response = response.response.on_hover_text(tooltip);
+
         // Kalau mic area di klik, toggle recording
-        let mut interact_rect = response.response.rect;
+        let mut interact_rect = pill_response.rect;
         // Hanya area kiri (mic) yang clickable biar ga konflik sama drag
         interact_rect.set_width(40.0);
         let click_sense = ui.interact(interact_rect, ui.id().with("mic_btn"), egui::Sense::click());
