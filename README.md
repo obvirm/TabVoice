@@ -6,7 +6,7 @@ Built in **Rust** for ultra-lightweight, zero-bloat performance and powered by t
 
 ### Video Showcase
 
-https://github.com/obvirm/TabVoice/raw/master/media/showcase.mp4
+![Video Showcase](media/showcase.gif)
 
 ![TabVoice Showcase](media/ss.png)
 
