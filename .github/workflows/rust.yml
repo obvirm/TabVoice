@@ -12,15 +12,23 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
     - uses: actions/checkout@v4
+    - uses: ilammy/msvc-dev-cmd@v1
     
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake build-essential libasound2-dev libx11-dev libxtst-dev libglib2.0-dev
-        
-    - name: Build
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      
+    - name: Build CPU version
+      env:
+        TABVOICE_NO_CUDA: "1"
+        LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
       run: cargo build --release --verbose
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: tabvoice-cpu-only
+        path: target/release/tabvoice.exe

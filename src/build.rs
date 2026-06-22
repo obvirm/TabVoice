@@ -56,6 +56,8 @@ fn main() {
         env::set_var("PATH", &new_path);
     }
 
+    let use_cuda = env::var("TABVOICE_NO_CUDA").unwrap_or_else(|_| "0".to_string()) != "1";
+
     let mut cfg = cmake::Config::new(&whisper_src);
     cfg.generator("Ninja")
         .define("BUILD_SHARED_LIBS", "OFF")
@@ -63,20 +65,25 @@ fn main() {
         .define("WHISPER_BUILD_EXAMPLES", "OFF")
         .define("WHISPER_BUILD_SERVER", "OFF")
         .define("WHISPER_OPENVINO", "OFF")
-        .define("WHISPER_COREML", "OFF")
-        .define("GGML_CUDA", "ON") // Aktifkan GPU / CUDA Support
-        .profile("Release");
+        .define("WHISPER_COREML", "OFF");
+        
+    if use_cuda {
+        cfg.define("GGML_CUDA", "ON"); // Aktifkan GPU / CUDA Support
+    }
+    cfg.profile("Release");
 
     let dst = cfg.build();
 
     println!("cargo:rustc-link-lib=static=whisper");
     println!("cargo:rustc-link-lib=static=ggml-base");
     println!("cargo:rustc-link-lib=static=ggml-cpu");
-    println!("cargo:rustc-link-lib=static=ggml-cuda");
+    if use_cuda {
+        println!("cargo:rustc-link-lib=static=ggml-cuda");
+    }
     println!("cargo:rustc-link-lib=static=ggml");
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
 
-    if cfg!(windows) {
+    if cfg!(windows) && use_cuda {
         let mut cuda_path = env::var("CUDA_PATH").unwrap_or_default();
         if !Path::new(&cuda_path).join("lib").join("x64").join("cudart.lib").exists() {
             // Coba hardcode ke v13.2 kalau CUDA_PATH nyangkut di versi lama
