@@ -167,22 +167,63 @@ impl TabVoice {
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async move {
-                            if let Ok(mut resp) = reqwest::get(&url).await {
-                                let total = resp.content_length().unwrap_or(0) as f32;
-                                let mut downloaded = 0.0;
+                            let temp_path = current_model_path.with_extension("bin.download");
+                            let mut start_byte = 0;
+                            
+                            if let Ok(metadata) = std::fs::metadata(&temp_path) {
+                                start_byte = metadata.len();
+                            }
+                            
+                            let client = reqwest::Client::new();
+                            let req = if start_byte > 0 {
+                                client.get(&url).header("Range", format!("bytes={}-", start_byte))
+                            } else {
+                                client.get(&url)
+                            };
+
+                            if let Ok(mut resp) = req.send().await {
+                                let status = resp.status();
+                                // Jika server tidak support Range, dia akan balas 200 OK
+                                if status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                                    start_byte = 0; // Reset ke 0
+                                }
+
+                                let total_size = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                                    start_byte + resp.content_length().unwrap_or(0)
+                                } else {
+                                    resp.content_length().unwrap_or(0)
+                                };
+                                let total = total_size as f32;
+                                
+                                let mut downloaded = start_byte as f32;
                                 
                                 if let Some(parent) = current_model_path.parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
                                 
-                                if let Ok(mut file) = std::fs::File::create(&current_model_path) {
+                                let file_result = if start_byte > 0 {
+                                    std::fs::OpenOptions::new().append(true).open(&temp_path)
+                                } else {
+                                    std::fs::File::create(&temp_path)
+                                };
+
+                                if let Ok(mut file) = file_result {
+                                    let mut success = true;
                                     while let Ok(Some(chunk)) = resp.chunk().await {
                                         use std::io::Write;
-                                        let _ = file.write_all(&chunk);
+                                        if file.write_all(&chunk).is_err() {
+                                            success = false;
+                                            break;
+                                        }
                                         downloaded += chunk.len() as f32;
                                         if total > 0.0 {
                                             let _ = tx.send(AppEvent::DownloadProgress { progress: downloaded / total });
                                         }
+                                    }
+                                    
+                                    // Jika berhasil sampai akhir, rename!
+                                    if success && (total == 0.0 || downloaded >= total) {
+                                        let _ = std::fs::rename(&temp_path, &current_model_path);
                                     }
                                 }
                             }
