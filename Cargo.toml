@@ -9,7 +9,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
-license = "MIT"
+license = "Apache-2.0"
 authors = ["TabVoice Contributors"]
 description = "Voice-to-text typing tool ala Whispr Flow, powered by oxiwhisper"
 
