@@ -4,6 +4,7 @@
 //! callback, dan transcriber worker. Karena semua field di belakang `Mutex`,
 //! lock critical section diusahakan pendek (drop guard pattern).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -39,6 +40,10 @@ pub struct RecorderState {
 pub struct AppState {
     /// Model Whisper yang sudah di-load; `None` sebelum init atau setelah unload.
     pub model: Mutex<Option<Arc<WhisperModel>>>,
+    /// Generation counter — increment setiap kali model diganti atau di-unload.
+    /// Transcriber cek ini sebelum inference; kalau beda dari snapshot awal,
+    /// skip inference supaya gak pakai model lama yang sudah di-drop.
+    pub model_generation: AtomicU64,
     /// State recorder (shared antara hotkey + audio callback).
     pub recorder: Mutex<RecorderState>,
     /// Sender ke transcriber worker. Di-set sekali saat startup, di-drop saat shutdown.
@@ -51,6 +56,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             model: Mutex::new(None),
+            model_generation: AtomicU64::new(0),
             recorder: Mutex::new(RecorderState::default()),
             release_tx: Mutex::new(None),
             settings: Mutex::new(Settings::default()),

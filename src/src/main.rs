@@ -78,6 +78,7 @@ fn main() -> eframe::Result<()> {
     //    bisa dilepas sebelum await / blocking call.
     let app_state = Arc::new(app_state::AppState {
         model: Mutex::new(model_opt),
+        model_generation: std::sync::atomic::AtomicU64::new(0),
         recorder: Mutex::new(app_state::RecorderState::default()),
         release_tx: Mutex::new(Some(release_tx)),
         settings: Mutex::new(settings.clone()),
@@ -102,12 +103,23 @@ fn main() -> eframe::Result<()> {
 
     // 8. Register global hotkey (Ctrl+Shift+Space) dan spawn listener thread.
     //    Listener butuh Arc<AppState> untuk start/stop MicCapture saat press/release.
-    let _hotkey_handle = hotkey::register_push_to_talk(&settings.hotkey, event_tx.clone(), app_state.clone())
-        .expect("Failed to register hotkey Ctrl+Shift+Space");
+    let _hotkey_handle = match hotkey::register_push_to_talk(&settings.hotkey, event_tx.clone(), app_state.clone()) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("Failed to register hotkey: {e}. Use the mic button in the UI instead.");
+            None
+        }
+    };
 
     // 9. Init system tray icon + context menu. Tray spawn thread sendiri
     //    untuk message loop `GetMessageW`.
-    let _tray_handle = tray::init(event_tx.clone()).expect("Failed to init system tray");
+    let _tray_handle = match tray::init(event_tx.clone()) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("Failed to init system tray: {e}. Continuing without tray icon.");
+            None
+        }
+    };
 
     // 10. Build AppFlags & launch egui UI.
     let flags = AppFlags {

@@ -107,25 +107,17 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=c++");
     }
 
-    let bindings = bindgen::Builder::default()
-        .header(whisper_src.join("include/whisper.h").to_string_lossy())
-        .clang_arg(format!("-I{}", whisper_src.join("include").display()))
-        .clang_arg(format!("-I{}", whisper_src.join("ggml/include").display()))
-        .clang_arg("-DWHISPER_BUILD_DLL=")
-        .allowlist_function("whisper_.*")
-        .allowlist_type("whisper_.*")
-        .allowlist_var("WHISPER_.*")
-        .opaque_type("whisper_context")
-        .opaque_type("whisper_state")
-        .opaque_type("whisper_vad_context")
-        .opaque_type("whisper_vad_segments")
-        .opaque_type("whisper_model_loader")
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("bindgen failed");
-
+    // BINDGEN DI-HILANGIN: pakai pre-generated whisper_bindings.rs di src/src/
+    // (copy manual biar build gak butuh libclang/bindgen)
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let pregen = manifest_dir.join("src/whisper_bindings.rs");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("whisper_bindings.rs");
-    bindings.write_to_file(&out_path).expect("write bindings");
+    if pregen.exists() {
+        fs::copy(&pregen, &out_path).expect("copy pre-generated whisper_bindings.rs");
+        println!("cargo:warning=Using pre-generated whisper_bindings.rs (skip bindgen)");
+    } else {
+        panic!("whisper_bindings.rs not found at {}; run build on Linux first to generate it", pregen.display());
+    }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let icon_src = manifest_dir.join("src/tray_icon.ico");

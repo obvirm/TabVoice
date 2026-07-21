@@ -46,7 +46,7 @@ impl Transcriber {
             timestamps: false,
             ..WhisperOptions::default()
         };
-        let m_opt = self.state.model.lock().unwrap().clone();
+        let m_opt = self.state.model.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(m) = m_opt {
             m.transcribe(audio, &opts)
         } else {
@@ -71,7 +71,7 @@ impl Transcriber {
         let idle_timeout = tokio::time::Duration::from_secs(15 * 60);
 
         loop {
-            let memory_mode = self.state.settings.lock().unwrap().memory_mode;
+            let memory_mode = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).memory_mode;
             let recv_res = match memory_mode {
                 crate::settings::MemoryMode::EcoMode => {
                     tokio::time::timeout(idle_timeout, release_rx.recv()).await
@@ -86,10 +86,11 @@ impl Transcriber {
                 Ok(None) => break, // Channel closed
                 Err(_) => {
                     // Timeout (EcoMode)
-                    let mut m = self.state.model.lock().unwrap();
+                    let mut m = self.state.model.lock().unwrap_or_else(|e| e.into_inner());
                     if m.is_some() {
                         log::info!("EcoMode: 15 minutes idle timeout reached. Unloading model to free RAM.");
                         *m = None;
+                        self.state.model_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     continue;
                 }
@@ -134,34 +135,61 @@ impl Transcriber {
                 continue;
             }
 
-            // Ambil model dari state jika ada. Jika None (lazy load atau di-unload EcoMode), load sekarang!
-            let model = {
-                let m_opt = self.state.model.lock().unwrap().clone();
-                if let Some(current_model) = m_opt {
-                    current_model
-                } else {
+            // Snapshot model + generation. Kalau model None, load ulang (lazy load).
+            let snapshot = {
+                let m_opt = self.state.model.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let gen = self.state.model_generation.load(std::sync::atomic::Ordering::Relaxed);
+                (m_opt, gen)
+            };
+
+            let (model, model_gen) = match snapshot.0 {
+                Some(m) => (m, snapshot.1),
+                None => {
+                    // Lazy load: model belum ada (mis. EcoMode unload atau startup).
                     let _ = event_tx.send(AppEvent::TranscriptionPartial {
                         text: "Memuat model ke RAM...".into(),
                     });
                     
-                    let settings = self.state.settings.lock().unwrap().clone();
+                    let settings = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     
-                    let new_model = tokio::task::spawn_blocking(move || {
+                    let load_result = tokio::task::spawn_blocking(move || -> Result<Arc<WhisperModel>, WhisperError> {
                         const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
                         match crate::ffi::WhisperModel::from_file(&settings.model_path) {
-                            Ok(m) => Arc::new(m),
-                            Err(_) => Arc::new(crate::ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES).unwrap())
+                            Ok(m) => Ok(Arc::new(m)),
+                            Err(_) => {
+                                let m = crate::ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES)?;
+                                Ok(Arc::new(m))
+                            }
                         }
-                    }).await.expect("spawn_blocking failed");
+                    }).await;
+
+                    let new_model = match load_result {
+                        Ok(Ok(m)) => m,
+                        Ok(Err(e)) => {
+                            log::error!("Model loading failed: {e}");
+                            let _ = event_tx.send(AppEvent::Error {
+                                message: format!("Failed to load model: {e}"),
+                            });
+                            continue;
+                        }
+                        Err(join_err) => {
+                            log::error!("Model loading task panicked: {join_err}");
+                            let _ = event_tx.send(AppEvent::Error {
+                                message: "Model loading task panicked".into(),
+                            });
+                            continue;
+                        }
+                    };
                     
-                    *self.state.model.lock().unwrap() = Some(Arc::clone(&new_model));
-                    new_model
+                    *self.state.model.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&new_model));
+                    self.state.model_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (new_model, snapshot.1 + 1)
                 }
             };
             let lang = self.language.clone();
             let sample_count = samples.len();
 
-            let vad_threshold = self.state.settings.lock().unwrap().vad_threshold;
+            let vad_threshold = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).vad_threshold;
 
             // Sederhana: Hitung RMS (Root Mean Square) volume untuk VAD (Voice Activity Detection)
             // Untuk realtime (partial), kita hanya cek 1 detik terakhir. 
@@ -194,6 +222,13 @@ impl Transcriber {
             );
 
             // Inference CPU-bound: jalankan di thread pool blocking.
+            // Cek lagi generation sebelum inference — kalau model berubah saat VAD,
+            // skip supaya gak pakai model yang sudah di-drop.
+            let current_gen = self.state.model_generation.load(std::sync::atomic::Ordering::Relaxed);
+            if current_gen != model_gen {
+                log::info!("Model changed during VAD (gen {} -> {}), skipping inference", model_gen, current_gen);
+                continue;
+            }
             let join_result = tokio::task::spawn_blocking(move || {
                 let opts = WhisperOptions {
                     language: lang,
@@ -250,7 +285,7 @@ impl Transcriber {
                     }
 
                     let (is_realtime, paste_on_release) = {
-                        let settings = self.state.settings.lock().unwrap();
+                        let settings = self.state.settings.lock().unwrap_or_else(|e| e.into_inner());
                         (settings.realtime, settings.paste_on_release)
                     };
 
@@ -261,10 +296,10 @@ impl Transcriber {
                         );
                         if is_realtime && paste_on_release {
                             let text_trimmed = cleaned.trim();
-                            let mut rec = self.state.recorder.lock().unwrap();
+                            let mut rec = self.state.recorder.lock().unwrap_or_else(|e| e.into_inner());
                             if !text_trimmed.is_empty() {
                                 if text_trimmed.starts_with(&rec.pasted_partial_text) {
-                                    let diff = &text_trimmed[rec.pasted_partial_text.len()..];
+                                    let diff = text_trimmed.get(rec.pasted_partial_text.len()..).unwrap_or("");
                                     if !diff.is_empty() {
                                         let _ = crate::paste::paste_text(diff);
                                     }
@@ -286,10 +321,10 @@ impl Transcriber {
                         );
                         if paste_on_release {
                             let text_trimmed = cleaned.trim();
-                            let mut rec = self.state.recorder.lock().unwrap();
+                            let mut rec = self.state.recorder.lock().unwrap_or_else(|e| e.into_inner());
                             if is_realtime && !rec.pasted_partial_text.is_empty() {
                                 if text_trimmed.starts_with(&rec.pasted_partial_text) {
-                                    let diff = &text_trimmed[rec.pasted_partial_text.len()..];
+                                    let diff = text_trimmed.get(rec.pasted_partial_text.len()..).unwrap_or("");
                                     if !diff.is_empty() {
                                         if let Err(e) = crate::paste::paste_text(diff) {
                                             log::warn!("paste_text failed: {e}");

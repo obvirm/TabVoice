@@ -44,6 +44,8 @@ pub enum AppEvent {
     },
     /// Download selesai
     DownloadComplete,
+    /// Model berhasil di-reload ke memory (setelah download atau klik Reload Model).
+    ModelReloaded { path: String },
 }
 
 /// Aksi yang dikirim dari system tray menu (Phase 6).

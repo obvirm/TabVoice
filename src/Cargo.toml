@@ -38,7 +38,6 @@ reqwest = { version = "0.13.3", features = ["stream", "rustls"] }
 
 [build-dependencies]
 cmake = { workspace = true }
-bindgen = { workspace = true }
 winres = "0.1.12"
 
 # Windows-only: Win32 SendInput untuk auto-paste Ctrl+V

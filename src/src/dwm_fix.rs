@@ -22,8 +22,6 @@
 
 
 #[cfg(windows)]
-
-#[cfg(windows)]
 use windows::Win32::Foundation::{BOOL, HWND};
 #[cfg(windows)]
 use windows::Win32::Graphics::Dwm::{
@@ -40,28 +38,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 #[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+
+#[cfg(windows)]
+static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(windows)]
+static FOUND_PID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(windows)]
 /// Find our main window HWND via EnumWindows + process PID matching.
 /// Returns the first visible top-level window owned by this process.
+#[cfg(windows)]
 unsafe fn find_our_hwnd() -> Option<HWND> {
-
-    // Closure untuk callback. Karena EnumWindows butuh fn pointer (bukan
-    // closure dengan captured state), pakai static atomic untuk simpan hasil.
-    static mut FOUND_HWND: isize = 0;
-    static mut FOUND_PID: u32 = 0;
-
-    // SAFETY: Ini satu-shot, called from main thread sebelum runtime spawn.
-    // `FOUND_HWND`/`FOUND_PID` hanya di-tulis di sini dan di-baca setelah
-    // EnumWindows return, jadi tidak ada race.
-    FOUND_HWND = 0;
-    FOUND_PID = 0;
+    FOUND_HWND.store(0, Ordering::SeqCst);
+    FOUND_PID.store(0, Ordering::SeqCst);
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: windows::Win32::Foundation::LPARAM) -> BOOL {
         let mut pid: u32 = 0;
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
         let my_pid = GetCurrentProcessId();
         if pid == my_pid && IsWindowVisible(hwnd).as_bool() {
-            FOUND_HWND = hwnd.0 as isize;
-            FOUND_PID = pid;
+            FOUND_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+            FOUND_PID.store(pid, Ordering::SeqCst);
             return BOOL(0); // FALSE = stop enum
         }
         BOOL(1) // TRUE = continue
@@ -69,8 +67,9 @@ unsafe fn find_our_hwnd() -> Option<HWND> {
 
     let _ = EnumWindows(Some(enum_proc), windows::Win32::Foundation::LPARAM(0));
 
-    if FOUND_HWND != 0 {
-        Some(HWND(FOUND_HWND as *mut _))
+    let found = FOUND_HWND.load(Ordering::SeqCst);
+    if found != 0 {
+        Some(HWND(found as *mut _))
     } else {
         None
     }
@@ -85,7 +84,7 @@ unsafe fn find_our_hwnd() -> Option<HWND> {
 pub fn disable_dwm_effects() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        std::thread::Builder::new()
+        let result = std::thread::Builder::new()
             .name("dwm-fix".to_string())
             .spawn(|| {
                 // Fase 1: Retry sampai window visible (max 5 detik).
@@ -106,15 +105,14 @@ pub fn disable_dwm_effects() {
                 };
 
                 // Fase 2: Periodik re-apply setiap 3 detik.
-                // Ini memastikan kalau Windows mereset style (misalnya karena
-                // DPI change, monitor reconnect, Windows update, dll),
-                // pill tetap always-on-top dan tidak muncul di taskbar.
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     apply_window_flags(hwnd);
                 }
-            })
-            .expect("gagal spawn dwm-fix thread");
+            });
+        if let Err(e) = result {
+            log::error!("Gagal spawn dwm-fix thread: {e}");
+        }
     });
 }
 

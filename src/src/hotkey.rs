@@ -7,12 +7,12 @@
 //! 2. Trigger `MicCapture` start/stop (yang push samples ke `recorder.samples`
 //!    dan emit `AppEvent::Amplitude`),
 //! 3. Saat release: kirim samples ke `release_tx` (transcriber worker).
-//!
-//! `HotkeyHandle` owns `GlobalHotKeyManager` — saat handle di-drop, manager drop →
-//! OS unregister hotkey otomatis (Windows: `UnregisterHotKey` di destructor).
+//! `HotkeyHandle` cuma marker — manager disimpan di `AppState`
+//! (hidup terus selama proses); ganti shortcut lewat [`reregister_hotkey`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -22,29 +22,44 @@ use crate::audio;
 use crate::events::{AppEvent, EventSender};
 use crate::state::AppState;
 
-/// Global guard: pastikan hanya SATU push-to-talk yang aktif per-proses.
-/// `register_push_to_talk` akan return error kalau handle sebelumnya masih hidup.
-static HOTKEY_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Wrapper supaya `GlobalHotKeyManager` bisa di-share lintas thread.
+/// SAFE karena manager cuma diakses dari main thread (UI thread) dan
+/// listener thread cuma baca `CURRENT_HOTKEY` (bukan manager).
+struct SendSyncManager(Mutex<Option<GlobalHotKeyManager>>);
+unsafe impl Send for SendSyncManager {}
+unsafe impl Sync for SendSyncManager {}
 
-/// Handle yang owns `GlobalHotKeyManager` + id hotkey.
+impl SendSyncManager {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<GlobalHotKeyManager>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Manager global hotkey — dibuat SEKALI (di `register_push_to_talk`, thread
+/// utama) dan hidup terus selama proses. Disimpan di `OnceLock` supaya
+/// shortcut bisa di-re-register (ganti tanpa restart) tanpa membuat manager baru.
+static HOTKEY_MANAGER: OnceLock<SendSyncManager> = OnceLock::new();
+
+/// Hotkey yang sedang aktif: dipakai untuk filter event di listener thread
+/// DAN untuk re-registration. Di-update tiap kali register / re-register.
+static CURRENT_HOTKEY: Mutex<Option<HotKey>> = Mutex::new(None);
+
+/// Pastikan listener thread hanya di-spawn sekali.
+static LISTENER_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Handle penanda bahwa global hotkey sedang terdaftar.
 ///
-/// PENTING: jangan di-drop sebelum app selesai — kalau di-drop, hotkey ke-unregister
-/// dari OS (Windows: `UnregisterHotKey`) dan listener thread kehilangan filter.
+/// Manager disimpan di static [`HOTKEY_MANAGER`] (bukan di-hold handle ini),
+/// sehingga handle ini cuma marker — `Drop`-nya tidak unregister hotkey
+/// (kita ganti shortcut lewat [`reregister_hotkey`] tanpa drop manager).
 pub struct HotkeyHandle {
-    /// Global hotkey manager (Windows: pegang thread-local Win32 state).
-    pub manager: GlobalHotKeyManager,
-    /// ID dari hotkey yang kita register (dipakai filter event di listener thread).
+    /// ID hotkey yang sedang aktif (referensi/log saja).
     pub hotkey_id: u32,
 }
 
 impl Drop for HotkeyHandle {
     fn drop(&mut self) {
-        // Lepas idempotency guard agar bisa register ulang (mis. setelah reload settings).
-        HOTKEY_REGISTERED.store(false, Ordering::SeqCst);
-        log::debug!(
-            "HotkeyHandle dropped, hotkey id={} unregistered",
-            self.hotkey_id
-        );
+        log::debug!("HotkeyHandle dropped, hotkey id={}", self.hotkey_id);
     }
 }
 
@@ -69,50 +84,38 @@ pub fn register_push_to_talk(
     event_tx: EventSender,
     state: Arc<AppState>,
 ) -> Result<HotkeyHandle> {
-    // Idempotency guard: tolak kalau handle sebelumnya masih hidup.
-    if HOTKEY_REGISTERED.swap(true, Ordering::SeqCst) {
-        anyhow::bail!("Push-to-talk hotkey sudah terdaftar (HotkeyHandle masih hidup)");
-    }
+    let manager = HOTKEY_MANAGER.get_or_init(|| {
+        let mgr = GlobalHotKeyManager::new()
+            .expect("Gagal membuat GlobalHotKeyManager");
+        SendSyncManager(Mutex::new(Some(mgr)))
+    });
+    let mgr_guard = manager.lock();
+    let hotkey = parse_hotkey_string(hotkey_str)
+        .ok_or_else(|| anyhow::anyhow!("Format hotkey tidak valid: {}", hotkey_str))?;
+    let hotkey_id = hotkey.id();
+    mgr_guard.as_ref().unwrap().register(hotkey)
+        .with_context(|| format!("Gagal mendaftarkan hotkey id={}", hotkey_id))?;
+    drop(mgr_guard);
 
-    // Inner closure: kalau ada step yang gagal, reset guard di outer.
-    let result: Result<HotkeyHandle> = (|| {
-        let manager = GlobalHotKeyManager::new()
-            .context("Gagal membuat GlobalHotKeyManager")?;
+    *CURRENT_HOTKEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(hotkey);
 
-        let hotkey = parse_hotkey_string(hotkey_str)
-            .ok_or_else(|| anyhow::anyhow!("Format hotkey tidak valid: {}", hotkey_str))?;
-        
-        let hotkey_id = hotkey.id();
+    log::info!("Hotkey terdaftar: {} (id={})", hotkey_str, hotkey_id);
 
-        manager
-            .register(hotkey)
-            .with_context(|| format!("Gagal mendaftarkan hotkey id={}", hotkey_id))?;
-
-        log::info!(
-            "Hotkey terdaftar: {} (id={})",
-            hotkey_str,
-            hotkey_id
-        );
-
-        // Spawn thread forwarder: polling global receiver → handle press/release.
+    // Spawn listener thread SEKALI (di-guard oleh LISTENER_SPAWNED).
+    if !LISTENER_SPAWNED.swap(true, Ordering::SeqCst) {
         std::thread::Builder::new()
             .name("tabvoice-hotkey".to_string())
-            .spawn(move || hotkey_listener_loop(hotkey_id, event_tx, state))
+            .spawn(move || hotkey_listener_loop(event_tx, state))
             .context("Gagal spawn hotkey listener thread")?;
-
-        Ok(HotkeyHandle { manager, hotkey_id })
-    })();
-
-    if result.is_err() {
-        // Reset guard supaya caller bisa retry.
-        HOTKEY_REGISTERED.store(false, Ordering::SeqCst);
     }
 
-    result
+    Ok(HotkeyHandle { hotkey_id })
 }
 
 /// Loop utama listener: polling global receiver, filter by id, dispatch ke handle_press/release.
-fn hotkey_listener_loop(hotkey_id: u32, event_tx: EventSender, state: Arc<AppState>) {
+fn hotkey_listener_loop(event_tx: EventSender, state: Arc<AppState>) {
     let receiver = GlobalHotKeyEvent::receiver();
     loop {
         let event = match receiver.recv() {
@@ -124,9 +127,17 @@ fn hotkey_listener_loop(hotkey_id: u32, event_tx: EventSender, state: Arc<AppSta
             }
         };
 
-        // Filter: hanya proses event dari hotkey kita (abaikan event dari hotkey lain
-        // yang di-register app/process lain).
-        if event.id != hotkey_id {
+        // Filter: hanya proses event dari hotkey yang sedang aktif. ID dibaca
+        // tiap iterasi supaya listener otomatis mengikuti shortcut yang
+        // di-re-register lewat settings (tanpa spawn ulang thread).
+        let current_id = CURRENT_HOTKEY
+            .lock()
+            .map(|g| g.as_ref().map(|h| h.id()))
+            .unwrap_or(None);
+        let Some(id) = current_id else {
+            continue;
+        };
+        if event.id != id {
             continue;
         }
 
@@ -169,19 +180,26 @@ fn hotkey_listener_loop(hotkey_id: u32, event_tx: EventSender, state: Arc<AppSta
 /// 3. Start `MicCapture` (pakai device sample rate & channels default),
 ///    simpan handle ke `recorder.mic`.
 pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
-    // 1. Cek apakah sudah ada mic aktif (double-press case). Kalau ada, drop dulu
-    //    supaya tidak ada stream leak.
-    {
-        let mut rec = state.recorder.lock().unwrap();
-        if rec.mic.lock().unwrap().is_some() {
-            log::warn!("Hotkey press: mic handle sudah ada, drop dulu");
-            rec.mic.lock().unwrap().take();
-        }
+    // 1. Cek apakah sudah ada mic aktif (double-press case). Ambil handle lama
+    //    KELUAR dari Mutex, lalu drop di LUAR lock.
+    //
+    //    PENTING: Drop `MicCapture` = drop cpal `Stream` = join audio thread.
+    //    Kalau kita drop mic sambil masih memegang `recorder.lock()`, dan pada
+    //    saat yang sama audio callback (`on_samples`) sedang berjalan dan juga
+    //    mengambil `recorder.lock()`, maka terjadi deadlock: thread hotkey
+    //    menunggu audio thread selesai (join), tapi audio thread menunggu
+    //    `recorder.lock()` yang kita pegang → aplikasi HANG ("ngeheng") dan
+    //    shortcut mati. Makanya mic di-drop setelah lock dilepas.
+    let old_mic = {
+        let mut rec = state.recorder.lock().unwrap_or_else(|e| e.into_inner());
+        let old = rec.mic.lock().unwrap_or_else(|e| e.into_inner()).take();
         rec.is_recording = true;
         rec.samples.clear();
         rec.last_partial_len = 0;
         rec.pasted_partial_text.clear();
-    }
+        old
+    };
+    drop(old_mic);
 
     // 2. Bangun callback yang capture event_tx & state (clone Arc).
     let event_tx_cb = event_tx.clone();
@@ -225,7 +243,7 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
     let (hint_rate, hint_channels) =
         detect_default_input_config().unwrap_or((48_000, 1));
         
-    let device_name = state.settings.lock().unwrap().device_name.clone();
+    let device_name = state.settings.lock().unwrap_or_else(|e| e.into_inner()).device_name.clone();
 
     // 4. Start MicCapture dengan callback wrapper.
     let capture = match audio::start_capture(hint_rate, hint_channels, device_name.as_deref(), move |s, r| {
@@ -235,7 +253,7 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
         Err(e) => {
             log::error!("Hotkey press: gagal start MicCapture: {e}");
             // Reset state agar UI tidak stuck di Recording.
-            let mut rec = state.recorder.lock().unwrap();
+            let mut rec = state.recorder.lock().unwrap_or_else(|e| e.into_inner());
             rec.is_recording = false;
             rec.samples.clear();
             let _ = event_tx.send(AppEvent::Error {
@@ -249,8 +267,8 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
     //    sekarang lock lagi untuk assign mic. Sebenarnya bisa digabung, tapi begini lebih
     //    jelas boundary-nya.
     {
-        let rec = state.recorder.lock().unwrap();
-        *rec.mic.lock().unwrap() = Some(capture);
+        let rec = state.recorder.lock().unwrap_or_else(|e| e.into_inner());
+        *rec.mic.lock().unwrap_or_else(|e| e.into_inner()) = Some(capture);
     }
 
     log::info!("Hotkey pressed: MicCapture started");
@@ -264,15 +282,18 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
 /// 3. Set `is_recording = false`.
 /// 4. Emit `AppEvent::Amplitude { 0.0 }` untuk reset waveform UI.
 pub fn handle_release(event_tx: &EventSender, state: &Arc<AppState>) {
-    // 1+2. Stop MicCapture + drain samples dalam satu critical section.
-    let samples = {
-        let mut rec = state.recorder.lock().unwrap();
-        // Drop MicCapture (stop stream).
-        rec.mic.lock().unwrap().take();
+    // 1+2. Ambil MicCapture (stop stream) + drain samples. Mic di-drop di LUAR
+    //    lock — lihat penjelasan deadlock di `handle_press`.
+    let (old_mic, samples) = {
+        let mut rec = state.recorder.lock().unwrap_or_else(|e| e.into_inner());
+        let old = rec.mic.lock().unwrap_or_else(|e| e.into_inner()).take();
         // Drain samples.
-        std::mem::take(&mut rec.samples)
-        // `rec` di-drop di sini — lock dilepas sebelum blocking call (send ke channel).
+        let samples = std::mem::take(&mut rec.samples);
+        (old, samples)
+        // `rec` di-drop di sini — lock dilepas sebelum blocking call / drop mic.
     };
+    // Drop MicCapture di LUAR lock (join audio thread) — cegah deadlock.
+    drop(old_mic);
 
     let sample_count = samples.len();
     log::info!(
@@ -282,7 +303,7 @@ pub fn handle_release(event_tx: &EventSender, state: &Arc<AppState>) {
     );
 
     // 3. Kirim ke transcriber worker kalau channel masih hidup.
-    if let Some(tx) = state.release_tx.lock().unwrap().as_ref() {
+    if let Some(tx) = state.release_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if let Err(e) = tx.send(crate::transcriber::TranscriberInput::Final(samples)) {
             log::warn!("Gagal kirim samples ke release_tx (transcriber sudah drop?): {e}");
         }
@@ -291,7 +312,7 @@ pub fn handle_release(event_tx: &EventSender, state: &Arc<AppState>) {
     }
 
     // 4. Set is_recording = false.
-    state.recorder.lock().unwrap().is_recording = false;
+    state.recorder.lock().unwrap_or_else(|e| e.into_inner()).is_recording = false;
 
     // 5. Emit Amplitude 0.0 untuk reset waveform UI.
     let _ = event_tx.send(AppEvent::Amplitude { value: 0.0 });
@@ -337,6 +358,10 @@ pub fn parse_hotkey_string(s: &str) -> Option<HotKey> {
             "tab" => key_code = Some(Tab),
             "escape" | "esc" => key_code = Some(Escape),
             "backspace" => key_code = Some(Backspace),
+            "up" => key_code = Some(ArrowUp),
+            "down" => key_code = Some(ArrowDown),
+            "left" => key_code = Some(ArrowLeft),
+            "right" => key_code = Some(ArrowRight),
             _ => {
                 // F1..F12
                 if let Some(n) = lower.strip_prefix('f') {
@@ -359,6 +384,20 @@ pub fn parse_hotkey_string(s: &str) -> Option<HotKey> {
                         continue;
                     }
                 }
+                // Single letter A-Z
+                let chars: Vec<char> = lower.chars().collect();
+                if chars.len() == 1 {
+                    let c = chars[0];
+                    if c.is_ascii_alphabetic() {
+                        key_code = letter_to_code(c);
+                        continue;
+                    }
+                    // Single digit 0-9
+                    if c.is_ascii_digit() {
+                        key_code = digit_to_code(c);
+                        continue;
+                    }
+                }
                 // Token tidak dikenali.
                 return None;
             }
@@ -372,6 +411,104 @@ pub fn parse_hotkey_string(s: &str) -> Option<HotKey> {
         Some(modifiers)
     };
     Some(HotKey::new(mods, code))
+}
+
+/// Petakan huruf ASCII ke `Code` keyboard (KeyA..KeyZ).
+fn letter_to_code(c: char) -> Option<Code> {
+    Some(match c {
+        'a' => Code::KeyA,
+        'b' => Code::KeyB,
+        'c' => Code::KeyC,
+        'd' => Code::KeyD,
+        'e' => Code::KeyE,
+        'f' => Code::KeyF,
+        'g' => Code::KeyG,
+        'h' => Code::KeyH,
+        'i' => Code::KeyI,
+        'j' => Code::KeyJ,
+        'k' => Code::KeyK,
+        'l' => Code::KeyL,
+        'm' => Code::KeyM,
+        'n' => Code::KeyN,
+        'o' => Code::KeyO,
+        'p' => Code::KeyP,
+        'q' => Code::KeyQ,
+        'r' => Code::KeyR,
+        's' => Code::KeyS,
+        't' => Code::KeyT,
+        'u' => Code::KeyU,
+        'v' => Code::KeyV,
+        'w' => Code::KeyW,
+        'x' => Code::KeyX,
+        'y' => Code::KeyY,
+        'z' => Code::KeyZ,
+        _ => return None,
+    })
+}
+
+/// Petakan digit ASCII ke `Code` keyboard (Digit0..Digit9).
+fn digit_to_code(c: char) -> Option<Code> {
+    Some(match c {
+        '0' => Code::Digit0,
+        '1' => Code::Digit1,
+        '2' => Code::Digit2,
+        '3' => Code::Digit3,
+        '4' => Code::Digit4,
+        '5' => Code::Digit5,
+        '6' => Code::Digit6,
+        '7' => Code::Digit7,
+        '8' => Code::Digit8,
+        '9' => Code::Digit9,
+        _ => return None,
+    })
+}
+
+/// String representasi hotkey yang sedang aktif (untuk revert saat re-register gagal).
+pub fn current_hotkey_string() -> Option<String> {
+    CURRENT_HOTKEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|h| (*h).into_string())
+}
+
+/// Ganti shortcut global yang aktif tanpa restart aplikasi.
+///
+/// Dipanggil dari UI Settings (thread utama) saat user menyimpan hotkey baru.
+/// Membatalkan pendaftaran hotkey lama lalu mendaftarkan yang baru di manager
+/// yang sama.
+pub fn reregister_hotkey(hotkey_str: &str) -> Result<()> {
+    let mgr = HOTKEY_MANAGER
+        .get()
+        .context("GlobalHotKeyManager belum di-init (register_push_to_talk belum dipanggil)")?;
+
+    let new_hotkey = parse_hotkey_string(hotkey_str)
+        .ok_or_else(|| anyhow::anyhow!("Format hotkey tidak valid: {}", hotkey_str))?;
+
+    // Batalkan pendaftaran hotkey lama (best-effort).
+    let old = CURRENT_HOTKEY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(old) = old {
+        if let Some(m) = mgr.lock().as_mut() {
+            let _ = m.unregister(old);
+        }
+    }
+
+    // Daftarkan yang baru.
+    if let Some(m) = mgr.lock().as_ref() {
+        m.register(new_hotkey)
+            .with_context(|| format!("Gagal mendaftarkan hotkey baru: {}", hotkey_str))?;
+    } else {
+        anyhow::bail!("GlobalHotKeyManager not available in manager");
+    }
+
+    *CURRENT_HOTKEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_hotkey);
+
+    log::info!(
+        "Hotkey di-re-register ke: {} (id={})",
+        hotkey_str,
+        new_hotkey.id()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

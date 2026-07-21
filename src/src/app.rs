@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{mpsc::Receiver, Arc};
 
 use eframe::egui;
@@ -118,10 +119,11 @@ impl TabVoice {
                 self.download_progress = None;
             }
             AppEvent::ActiveHotkeyCaptured => {
-                let current_settings = self.state.settings.lock().unwrap().clone();
-                self.temp_hotkey = current_settings.hotkey;
-                self.assigning_hotkey = false;
-                IS_ASSIGNING_HOTKEY.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Sinyal bahwa tombol (hotkey yang sedang aktif) ke-tekan saat
+                // sedang assign. Penangkapan kombinasi tombol sebenarnya dilakukan
+                // langsung oleh egui (`ctx.input`) di panel Settings, jadi di sini
+                // kita TIDAK mengubah `temp_hotkey` agar assignment user tidak
+                // tertimpa kembali ke hotkey lama.
             }
             AppEvent::HotkeyPressed | AppEvent::HotkeyReleased => {}
             AppEvent::TrayAction(action) => self.handle_tray(action),
@@ -130,25 +132,15 @@ impl TabVoice {
             }
             AppEvent::DownloadComplete => {
                 self.download_progress = None;
-                // Reload model ke memory
-                let current_model_path = self.state.settings.lock().unwrap().model_path.clone();
-                if current_model_path.exists() {
-                    match crate::ffi::WhisperModel::from_file(&current_model_path) {
-                        Ok(new_model) => {
-                            let mut m = self.state.model.lock().unwrap();
-                            *m = Some(std::sync::Arc::new(new_model));
-                            self.text = "Model berhasil dimuat!".to_string();
-                            self.mode = UiMode::Done;
-                            self.fade_timer = 120;
-                        }
-                        Err(e) => {
-                            self.text = format!("Gagal memuat model: {}", e);
-                            self.mode = UiMode::Done;
-                            self.fade_timer = 120;
-                            let _ = std::fs::remove_file(&current_model_path);
-                        }
-                    }
-                }
+                // Download selesai, load model ke memory di background thread
+                let current_model_path = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).model_path.clone();
+                self.load_model_in_background(current_model_path);
+            }
+            AppEvent::ModelReloaded { path } => {
+                self.text = "Model berhasil dimuat!".to_string();
+                self.mode = UiMode::Done;
+                self.fade_timer = 120;
+                log::info!("Model reloaded: {}", path);
             }
         }
     }
@@ -160,11 +152,11 @@ impl TabVoice {
                     return; // Abaikan, sedang proses download
                 }
                 
-                let current_model_path = self.state.settings.lock().unwrap().model_path.clone();
+                let current_model_path = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).model_path.clone();
                 if current_model_path.exists() {
-                    let _ = self.event_tx.send(AppEvent::DownloadComplete);
+                    self.load_model_in_background(current_model_path);
                 } else {
-                    let model_name = current_model_path.file_name().unwrap().to_str().unwrap().to_string();
+                    let model_name = current_model_path.file_name().and_then(|n| n.to_str()).unwrap_or("ggml-base.bin").to_string();
                     let url = format!(
                         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
                         model_name
@@ -173,7 +165,13 @@ impl TabVoice {
                     let tx = self.event_tx.clone();
                     
                     std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::Error { message: format!("Gagal membuat async runtime: {}", e) });
+                                return;
+                            }
+                        };
                         rt.block_on(async move {
                             let temp_path = current_model_path.with_extension("bin.download");
                             let mut start_byte = 0;
@@ -261,7 +259,7 @@ impl TabVoice {
                 self.mode = UiMode::Settings;
                 self.available_models = list_available_models();
                 self.available_microphones = crate::audio::get_available_microphones();
-                let current = self.state.settings.lock().unwrap().clone();
+                let current = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 
                 let model_filename = current.model_path
                     .file_name()
@@ -285,6 +283,33 @@ impl TabVoice {
             }
         }
     }
+
+    /// Load model Whisper dari file path, di background thread supaya UI gak hang.
+    fn load_model_in_background(&self, path: PathBuf) {
+        let tx = self.event_tx.clone();
+        let state = self.state.clone();
+        std::thread::Builder::new()
+            .name("tabvoice-model-loader".to_string())
+            .spawn(move || {
+                log::info!("Loading model from: {:?}", path);
+                match crate::ffi::WhisperModel::from_file(&path) {
+                    Ok(new_model) => {
+                        log::info!("Model loaded successfully: {:?}", path);
+                        // Update state.model dengan model baru
+                        *state.model.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(new_model));
+                        // Increment generation biar transcriber tahu model diganti
+                        state.model_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = tx.send(AppEvent::ModelReloaded { path: path.to_string_lossy().to_string() });
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load model from {:?}: {}", path, e);
+                        let _ = tx.send(AppEvent::Error { message: format!("Gagal memuat model: {}", e) });
+                    }
+                }
+            })
+            .map_err(|e| log::error!("Failed to spawn model loader thread: {}", e))
+            .ok();
+    }
 }
 
 impl eframe::App for TabVoice {
@@ -293,7 +318,7 @@ impl eframe::App for TabVoice {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let is_dark = self.state.settings.lock().unwrap().dark_mode;
+        let is_dark = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).dark_mode;
         
         // Set egui global visuals
         if is_dark {
@@ -385,7 +410,7 @@ impl TabVoice {
 
         let mut ui = ui.child_ui(pill_rect, egui::Layout::centered_and_justified(egui::Direction::LeftToRight));
 
-        let is_dark = self.state.settings.lock().unwrap().dark_mode;
+        let is_dark = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).dark_mode;
         
         let (bg_color, _stroke_color) = if is_dark {
             (
@@ -492,9 +517,9 @@ impl TabVoice {
         });
 
         let (model_name, is_loaded) = {
-            let settings = self.state.settings.lock().unwrap();
+            let settings = self.state.settings.lock().unwrap_or_else(|e| e.into_inner());
             let name = settings.model_path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown").to_string();
-            let loaded = self.state.model.lock().unwrap().is_some();
+            let loaded = self.state.model.lock().unwrap_or_else(|e| e.into_inner()).is_some();
             (name, loaded)
         };
         let tooltip = if is_loaded {
@@ -634,7 +659,7 @@ impl TabVoice {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
-        let is_dark = self.state.settings.lock().unwrap().dark_mode;
+        let is_dark = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).dark_mode;
         
         let (bg_color, _stroke_color, text_color, header_color) = if is_dark {
             (
@@ -718,21 +743,27 @@ impl TabVoice {
                             IS_ASSIGNING_HOTKEY.store(false, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             ctx.input(|i| {
-                                let mut mods = Vec::new();
+                                // Susun daftar modifier dari status yang sedang dipegang.
+                                let mut mods: Vec<&str> = Vec::new();
                                 if i.modifiers.ctrl { mods.push("Ctrl"); }
                                 if i.modifiers.shift { mods.push("Shift"); }
                                 if i.modifiers.alt { mods.push("Alt"); }
-                                
-                                let mut primary_key = None;
-                                for key in &i.keys_down {
-                                    primary_key = Some(format!("{:?}", key));
-                                }
-                                
-                                if let Some(pk) = primary_key {
-                                    mods.push(&pk);
-                                    self.temp_hotkey = mods.join("+");
-                                    self.assigning_hotkey = false;
-                                    IS_ASSIGNING_HOTKEY.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                                // Ambil tombol utama (bukan modifier) yang sedang ditekan.
+                                // egui sudah memisahkan modifier dari `keys_down`, jadi kita
+                                // cukup ambil key pertama yang punya token valid.
+                                let primary = i.keys_down.iter().find_map(egui_key_to_hotkey_token);
+                                if let Some(token) = primary {
+                                    let mut parts = mods;
+                                    parts.push(token);
+                                    let candidate = parts.join("+");
+                                    // Hanya komit kalau string-nya bisa di-parse ulang
+                                    // menjadi HotKey yang valid (defensive).
+                                    if crate::hotkey::parse_hotkey_string(&candidate).is_some() {
+                                        self.temp_hotkey = candidate;
+                                        self.assigning_hotkey = false;
+                                        IS_ASSIGNING_HOTKEY.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                             });
                         }
@@ -789,7 +820,7 @@ impl TabVoice {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Save").clicked() {
-                        let new_settings = crate::settings::Settings {
+                        let mut new_settings = crate::settings::Settings {
                             model_path: crate::settings::get_models_dir().join(&self.temp_model_path),
                             language: if self.temp_language == "auto" || self.temp_language.trim().is_empty() { None } else { Some(self.temp_language.trim().to_string()) },
                             hotkey: self.temp_hotkey.clone(),
@@ -802,10 +833,24 @@ impl TabVoice {
                             vad_threshold: self.temp_vad_threshold,
                         };
 
+                        // Coba ganti shortcut global. Kalau gagal (format salah /
+                        // bentrok dengan aplikasi lain), kembalikan ke shortcut yang
+                        // sedang aktif agar runtime & settings tetap konsisten.
+                        let current_hotkey = crate::hotkey::current_hotkey_string()
+                            .unwrap_or_else(|| self.temp_hotkey.clone());
+                        if let Err(e) = crate::hotkey::reregister_hotkey(&self.temp_hotkey) {
+                            log::error!("Gagal mengubah hotkey: {e}");
+                            let _ = self.event_tx.send(AppEvent::Error {
+                                message: format!("Shortcut gagal diubah: {e}"),
+                            });
+                            new_settings.hotkey = current_hotkey.clone();
+                            self.temp_hotkey = current_hotkey;
+                        }
+
                         if let Err(e) = crate::settings::save(&new_settings) {
                             log::error!("Gagal menyimpan settings: {e}");
                         }
-                        *self.state.settings.lock().unwrap() = new_settings;
+                        *self.state.settings.lock().unwrap_or_else(|e| e.into_inner()) = new_settings;
                         self.mode = UiMode::Idle;
                         
                         // Otomatis trigger reload/download model yang baru disimpan!
@@ -818,6 +863,31 @@ impl TabVoice {
             });
         });
     }
+}
+
+fn egui_key_to_hotkey_token(key: &egui::Key) -> Option<&'static str> {
+    use egui::Key::*;
+    Some(match *key {
+        ArrowUp => "Up",
+        ArrowDown => "Down",
+        ArrowLeft => "Left",
+        ArrowRight => "Right",
+        Enter => "Enter",
+        Tab => "Tab",
+        Escape => "Esc",
+        Backspace => "Backspace",
+        Space => "Space",
+        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4",
+        F5 => "F5", F6 => "F6", F7 => "F7", F8 => "F8",
+        F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
+        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F", G => "G",
+        H => "H", I => "I", J => "J", K => "K", L => "L", M => "M", N => "N",
+        O => "O", P => "P", Q => "Q", R => "R", S => "S", T => "T", U => "U",
+        V => "V", W => "W", X => "X", Y => "Y", Z => "Z",
+        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
+        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
+        _ => return None,
+    })
 }
 
 fn list_available_models() -> Vec<String> {

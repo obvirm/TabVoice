@@ -10,9 +10,10 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
 mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/whisper_bindings.rs"));
+    include!("./whisper_bindings.rs");
 }
 
 /// Error type untuk semua operasi FFI whisper.
@@ -111,8 +112,12 @@ pub struct TranscribeResult {
 
 /// Owning wrapper untuk `*mut whisper_context`. `Drop` akan panggil
 /// `whisper_free` agar memori model di-release.
+///
+/// **Thread safety**: `whisper_full()` TIDAK thread-safe untuk concurrent access.
+/// Kita pakai internal `Mutex` buat serialisasi inference.
 pub struct WhisperModel {
     ctx: NonNull<bindings::whisper_context>,
+    inference_lock: Mutex<()>,
 }
 
 impl WhisperModel {
@@ -126,7 +131,10 @@ impl WhisperModel {
             bindings::whisper_init_from_file_with_params(cpath.as_ptr(), params)
         };
         NonNull::new(ctx)
-            .map(|ctx| WhisperModel { ctx })
+            .map(|ctx| WhisperModel { 
+                ctx,
+                inference_lock: Mutex::new(()),
+            })
             .ok_or(WhisperError::InitFailed)
     }
 
@@ -142,7 +150,10 @@ impl WhisperModel {
             )
         };
         NonNull::new(ctx)
-            .map(|ctx| WhisperModel { ctx })
+            .map(|ctx| WhisperModel { 
+                ctx,
+                inference_lock: Mutex::new(()),
+            })
             .ok_or(WhisperError::InitFailed)
     }
 
@@ -162,6 +173,11 @@ impl WhisperModel {
         audio: &[f32],
         opts: &WhisperOptions,
     ) -> Result<TranscribeResult, WhisperError> {
+        // Serialisasi akses ke whisper context — hanya satu inference pada satu waktu.
+        let _inference_guard = self.inference_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let strategy = if opts.beam_width.unwrap_or(1) > 1 {
             bindings::whisper_sampling_strategy_WHISPER_SAMPLING_BEAM_SEARCH
         } else {
