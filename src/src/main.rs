@@ -18,7 +18,32 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use tabvoice_lib::app::{AppFlags, TabVoice};
-use tabvoice_lib::{events, hotkey, settings, state as app_state, transcriber, tray};
+use tabvoice_lib::{events, ffi, hotkey, settings, state as app_state, transcriber, tray};
+
+/// Model bawaan (embedded) — fallback kalau file model tidak ada.
+const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
+
+/// Smoke test untuk CI headless (Windows/macOS runner): init core + load
+/// model + print backend info, TANPA membuka window GUI (eframe butuh
+/// GPU/display yang tidak reliable di runner).
+fn run_smoke_test(settings: &settings::Settings) -> anyhow::Result<()> {
+    log::info!("SMOKE: loading model from {:?}", settings.model_path);
+    let model = match ffi::WhisperModel::from_file(&settings.model_path) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("SMOKE: model file gagal ({e}), pakai embedded...");
+            ffi::WhisperModel::from_buffer(DEFAULT_MODEL_BYTES)
+                .map_err(|e2| anyhow::anyhow!("Embedded model gagal: {e2}"))?
+        }
+    };
+    log::info!(
+        "SMOKE OK: model type={}, multilingual={}",
+        model.model_type_readable(),
+        model.is_multilingual()
+    );
+    log::info!("SMOKE OK: system info:\n{}", ffi::whisper_system_info());
+    Ok(())
+}
 
 fn main() -> eframe::Result<()> {
     // 1. Init logger (default level `info`, override via RUST_LOG).
@@ -29,11 +54,21 @@ fn main() -> eframe::Result<()> {
     let settings = settings::load_or_default();
     log::info!("Settings loaded: model={:?}", settings.model_path);
 
+    // 2b. Mode smoke test (CI): tanpa GUI.
+    if std::env::args().any(|a| a == "--smoke-test") {
+        match run_smoke_test(&settings) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                log::error!("SMOKE FAIL: {e:#}");
+                eprintln!("SMOKE FAIL: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // 3. Load WhisperModel jika MemoryMode::LoadOnStartup
     //    Jika mode lain, model akan di-load saat hotkey ditekan pertama kali.
     let model_opt = if settings.memory_mode == tabvoice_lib::settings::MemoryMode::LoadOnStartup {
-        const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../../models/ggml-base.bin");
-
         let m = match tabvoice_lib::ffi::WhisperModel::from_file(&settings.model_path) {
             Ok(m) => Arc::new(m),
             Err(e) => {

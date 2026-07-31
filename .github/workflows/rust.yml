@@ -76,37 +76,40 @@ jobs:
       - name: Build release
         run: cargo build --release --verbose
 
-      - name: Smoke test (Windows)
+      - name: Smoke test (Windows) — launch + model load + backend info
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath ".\target\release\tabvoice.exe" -PassThru `
-            -RedirectStandardOutput "smoke.log" -RedirectStandardError "smoke_err.log"
-          Start-Sleep -Seconds 20
-          if ($p.HasExited) {
-            Write-Error "SMOKE FAIL: app exited early (code $($p.ExitCode))"
+          $p = Start-Process -FilePath ".\target\release\tabvoice.exe" `
+            -ArgumentList "--smoke-test" -PassThru `
+            -RedirectStandardOutput "smoke.log" -RedirectStandardError "smoke_err.log" -Wait
+          if ($p.ExitCode -ne 0) {
+            Write-Error "SMOKE FAIL: app exit code $($p.ExitCode)"
             if (Test-Path smoke.log) { Get-Content smoke.log }
             if (Test-Path smoke_err.log) { Get-Content smoke_err.log }
             exit 1
           }
-          Write-Output "SMOKE OK: app alive after 20s"
-          Stop-Process -Id $p.Id -Force
+          $log = ""
+          if (Test-Path smoke_err.log) { $log = Get-Content smoke_err.log -Raw }
+          if ($log -notmatch "SMOKE OK") {
+            Write-Error "SMOKE FAIL: tidak ada 'SMOKE OK' di log"
+            Write-Output $log
+            exit 1
+          }
+          Write-Output "SMOKE OK: app launch + model load + backend info"
 
-      - name: Smoke test (macOS)
+      - name: Smoke test (macOS) — launch + model load + backend info
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          ./target/release/tabvoice > smoke.log 2>&1 &
-          PID=$!
-          sleep 20
-          if kill -0 $PID 2>/dev/null; then
-            echo "SMOKE OK: app alive after 20s"
-            kill $PID
-          else
-            echo "SMOKE FAIL: app exited early"
+          ./target/release/tabvoice --smoke-test > smoke.log 2>&1
+          CODE=$?
+          if [ $CODE -ne 0 ] || ! grep -q "SMOKE OK" smoke.log; then
+            echo "SMOKE FAIL (exit $CODE)"
             cat smoke.log
             exit 1
           fi
+          echo "SMOKE OK: app launch + model load + backend info"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

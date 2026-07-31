@@ -340,6 +340,15 @@ pub struct ModelInfo {
     pub multilingual: bool,
 }
 
+/// System info whisper.cpp (CPU/backend yang terdeteksi saat build),
+/// untuk logging & smoke test.
+pub fn whisper_system_info() -> String {
+    unsafe {
+        let p = bindings::whisper_print_system_info();
+        cstr_to_string(p).unwrap_or_default()
+    }
+}
+
 // Send + Sync: whisper.cpp context TIDAK thread-safe per whisper.h docs
 // ("thread-safe as long as the sample whisper_context is not used by
 // multiple threads concurrently"). Kita jamin ini dengan semua akses

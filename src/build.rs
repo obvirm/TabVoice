@@ -84,13 +84,14 @@ fn main() {
         .define("WHISPER_OPENVINO", "OFF")
         .define("WHISPER_COREML", "OFF");
 
-    // Linux: GCC auto-detect OpenMP di ggml-cpu -> symbol GOMP_* yang
-    // tidak ter-link oleh Rust (butuh libgomp eksternal). macOS: AppleClang
-    // tidak punya OpenMP bawaan. Matikan OpenMP di non-Windows biar build
-    // portable tanpa dependency tambahan (Windows tetap pakai OpenMP MSVC
-    // seperti sekarang).
+    // Linux/macOS: matikan backend yang auto-terdeteksi cmake tapi tidak
+    // kita link: OpenMP (GCC -> symbol GOMP_*), BLAS (macOS Accelerate ->
+    // ggml_backend_blas_reg), Metal (macOS -> ggml_backend_metal_reg).
+    // Tanpa ini link gagal undefined symbol di macOS.
     if !cfg!(windows) {
         cfg.define("GGML_OPENMP", "OFF");
+        cfg.define("GGML_BLAS", "OFF");
+        cfg.define("GGML_METAL", "OFF");
     }
 
     if use_cuda {
