@@ -92,6 +92,9 @@ fn main() {
         cfg.define("GGML_OPENMP", "OFF");
         cfg.define("GGML_BLAS", "OFF");
         cfg.define("GGML_METAL", "OFF");
+        // macOS: ggml-cpu auto-detect Accelerate (vDSP) -> undefined symbol
+        // _vDSP_maxv kalau framework tidak di-link.
+        cfg.define("GGML_ACCELERATE", "OFF");
     }
 
     if use_cuda {
