@@ -39,9 +39,7 @@ pub enum AppEvent {
         message: String,
     },
     /// Progress download model (0.0 - 1.0)
-    DownloadProgress {
-        progress: f32,
-    },
+    DownloadProgress { progress: f32 },
     /// Download selesai
     DownloadComplete,
     /// Model berhasil di-reload ke memory (setelah download atau klik Reload Model).

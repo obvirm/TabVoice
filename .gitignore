@@ -19,3 +19,7 @@ models/*.bin
 models/*.gguf
 **/models/*.bin
 **/models/*.gguf
+MEMD.md
+
+# Pi agent state
+.pi/

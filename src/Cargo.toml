@@ -36,8 +36,13 @@ eframe = "0.27"
 egui = "0.27"
 reqwest = { version = "0.13.3", features = ["stream", "rustls"] }
 
+# Decode logo PNG untuk window/tray icon (cross-platform)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [build-dependencies]
 cmake = { workspace = true }
+
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1.12"
 
 # Windows-only: Win32 SendInput untuk auto-paste Ctrl+V
@@ -60,3 +65,8 @@ windows = { version = "0.58", features = [
 [target.'cfg(not(windows))'.dependencies]
 enigo = "0.2"
 tray-icon = "0.14"
+
+# tray-icon di Linux pakai libappindicator (GTK) — butuh gtk::init() sebelum build tray.
+# (macOS pakai NSStatusItem, tidak butuh GTK.)
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

@@ -16,7 +16,6 @@
 //! - `settings` — TOML config (Phase 3)
 //! - `tray`    — Shell_NotifyIconW via windows crate (Phase 6)
 
-
 pub mod app;
 pub mod audio;
 pub mod dwm_fix;
@@ -33,13 +32,13 @@ pub mod tray;
 
 #[cfg(not(windows))]
 pub mod tray {
-    use std::sync::mpsc::Sender;
-    use std::thread;
     use crate::events::{AppEvent, TrayAction};
     use anyhow::Result;
+    use std::sync::mpsc::Sender;
+    use std::thread;
     use tray_icon::{
         menu::{Menu, MenuItem, PredefinedMenuItem},
-        TrayIconBuilder, TrayIcon,
+        TrayIcon, TrayIconBuilder,
     };
 
     pub struct TrayHandle {
@@ -47,11 +46,17 @@ pub mod tray {
     }
 
     pub fn init(event_tx: Sender<AppEvent>) -> Result<TrayHandle> {
+        // tray-icon di Linux pakai libappindicator (GTK): wajib init GTK dulu
+        // sebelum membangun tray, kalau tidak panic "GTK has not been initialized".
+        #[cfg(target_os = "linux")]
+        gtk::init()
+            .map_err(|e| anyhow::anyhow!("gtk::init gagal (butuh display X11/Wayland): {:?}", e))?;
+
         let tray_menu = Menu::new();
         let item_settings = MenuItem::new("Settings", true, None);
         let item_reload = MenuItem::new("Reload Model", true, None);
         let item_quit = MenuItem::new("Quit", true, None);
-        
+
         let _ = tray_menu.append_items(&[
             &item_settings,
             &item_reload,
@@ -59,32 +64,47 @@ pub mod tray {
             &item_quit,
         ]);
 
-        let tray = TrayIconBuilder::new()
+        let mut tray_builder = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
-            .with_tooltip("TabVoice")
-            .build().map_err(|e| anyhow::anyhow!("Tray error: {:?}", e))?;
+            .with_tooltip("TabVoice");
+        if let Some((rgba, w, h)) = crate::app_icon_rgba() {
+            match tray_icon::Icon::from_rgba(rgba, w, h) {
+                Ok(icon) => tray_builder = tray_builder.with_icon(icon),
+                Err(e) => log::warn!("Gagal load tray icon: {e:?}"),
+            }
+        }
+        let tray = tray_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Tray error: {:?}", e))?;
 
         let menu_channel = tray_icon::menu::MenuEvent::receiver();
         let tray_channel = tray_icon::TrayIconEvent::receiver();
 
-        thread::spawn(move || {
-            loop {
-                if let Ok(event) = menu_channel.try_recv() {
-                    if event.id == item_settings.id() {
-                        let _ = event_tx.send(AppEvent::TrayAction(TrayAction::OpenSettings));
-                    } else if event.id == item_reload.id() {
-                        let _ = event_tx.send(AppEvent::TrayAction(TrayAction::ReloadModel));
-                    } else if event.id == item_quit.id() {
-                        let _ = event_tx.send(AppEvent::TrayAction(TrayAction::Quit));
-                    }
+        // Clone id sebelum dipindah ke thread (MenuId: Rc tidak Send).
+        let settings_id = item_settings.id().clone();
+        let reload_id = item_reload.id().clone();
+        let quit_id = item_quit.id().clone();
+
+        thread::spawn(move || loop {
+            if let Ok(event) = menu_channel.try_recv() {
+                if event.id == settings_id {
+                    let _ = event_tx.send(AppEvent::TrayAction(TrayAction::OpenSettings));
+                } else if event.id == reload_id {
+                    let _ = event_tx.send(AppEvent::TrayAction(TrayAction::ReloadModel));
+                } else if event.id == quit_id {
+                    let _ = event_tx.send(AppEvent::TrayAction(TrayAction::Quit));
                 }
-                if let Ok(event) = tray_channel.try_recv() {
-                    if let tray_icon::TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. } = event {
-                        let _ = event_tx.send(AppEvent::TrayAction(TrayAction::OpenSettings));
-                    }
-                }
-                thread::sleep(std::time::Duration::from_millis(50));
             }
+            if let Ok(event) = tray_channel.try_recv() {
+                if let tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                } = event
+                {
+                    let _ = event_tx.send(AppEvent::TrayAction(TrayAction::OpenSettings));
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
         });
 
         Ok(TrayHandle { _tray: tray })
@@ -92,5 +112,15 @@ pub mod tray {
 
     pub fn cleanup(_handle: TrayHandle) {}
 }
-pub mod keyboard_hook;
 pub mod focus;
+pub mod keyboard_hook;
+
+/// Load logo app (PNG 256x256, embedded) → raw RGBA + dimensi.
+/// Dipakai untuk window icon (egui) & tray icon non-Windows.
+pub fn app_icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    let png = include_bytes!("../tray_icon.png");
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Some((rgba.into_raw(), w, h))
+}

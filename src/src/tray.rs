@@ -15,17 +15,15 @@ use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NOTIFYICONDATAW, NIM_ADD, NIM_DELETE,
-    NIF_ICON, NIF_MESSAGE, NIF_TIP,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, GDI_IMAGE_TYPE, GetCursorPos,
-    GetMessageW, HMENU, HICON, LoadIconW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow, TrackPopupMenu, TranslateMessage, WNDCLASSEXW,
-    IDI_APPLICATION, IMAGE_FLAGS, LR_LOADFROMFILE, LR_SHARED, MF_SEPARATOR,
-    MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_COMMAND,
-    WM_DESTROY, WM_RBUTTONUP, WM_USER, WINDOW_EX_STYLE, WINDOW_STYLE, HWND_MESSAGE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
+    RegisterClassExW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, GDI_IMAGE_TYPE, HICON,
+    HMENU, HWND_MESSAGE, IDI_APPLICATION, IMAGE_FLAGS, LR_LOADFROMFILE, LR_SHARED, MF_SEPARATOR,
+    MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER, WNDCLASSEXW,
 };
 
 use crate::events::{AppEvent, TrayAction};
@@ -103,7 +101,10 @@ pub fn init(event_tx: Sender<AppEvent>) -> Result<TrayHandle> {
             CLASS_NAME,
             WINDOW_NAME,
             WINDOW_STYLE(0),
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             HWND_MESSAGE,
             HMENU(std::ptr::null_mut()),
             h_instance,
@@ -114,10 +115,7 @@ pub fn init(event_tx: Sender<AppEvent>) -> Result<TrayHandle> {
         let icon = load_embedded_icon().context("gagal extract tray icon")?;
 
         let mut sz_tip = [0u16; 128];
-        let tip_wide: Vec<u16> = TRAY_TIP
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let tip_wide: Vec<u16> = TRAY_TIP.encode_utf16().chain(std::iter::once(0)).collect();
         let copy_len = tip_wide.len().min(sz_tip.len());
         sz_tip[..copy_len].copy_from_slice(&tip_wide[..copy_len]);
 
@@ -280,7 +278,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let cmd = TrackPopupMenu(
         menu,
         TPM_NONOTIFY | TPM_RETURNCMD | TPM_RIGHTBUTTON,
-        pt.x, pt.y,
+        pt.x,
+        pt.y,
         0,
         hwnd,
         None,

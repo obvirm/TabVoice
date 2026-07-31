@@ -1,12 +1,15 @@
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::thread;
+#[cfg(windows)]
 use std::time::Duration;
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 #[cfg(windows)]
 use windows::Win32::System::Threading::GetCurrentProcessId;
 #[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+};
 
 static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
 

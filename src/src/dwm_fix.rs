@@ -19,8 +19,6 @@
 //!
 //! Reference: https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
 
-
-
 #[cfg(windows)]
 use windows::Win32::Foundation::{BOOL, HWND};
 #[cfg(windows)]
@@ -31,10 +29,9 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::System::Threading::GetCurrentProcessId;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
-    SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOPMOST,
+    EnumWindows, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetWindowLongW,
+    SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 #[cfg(windows)]
@@ -53,7 +50,10 @@ unsafe fn find_our_hwnd() -> Option<HWND> {
     FOUND_HWND.store(0, Ordering::SeqCst);
     FOUND_PID.store(0, Ordering::SeqCst);
 
-    unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: windows::Win32::Foundation::LPARAM) -> BOOL {
+    unsafe extern "system" fn enum_proc(
+        hwnd: HWND,
+        _lparam: windows::Win32::Foundation::LPARAM,
+    ) -> BOOL {
         let mut pid: u32 = 0;
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
         let my_pid = GetCurrentProcessId();
@@ -146,9 +146,7 @@ fn apply_window_flags(hwnd: HWND) {
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
         // Tambahkan WS_EX_TOOLWINDOW (hide from taskbar) dan WS_EX_NOACTIVATE
-        let desired = ex_style
-            | WS_EX_TOOLWINDOW.0
-            | WS_EX_NOACTIVATE.0;
+        let desired = ex_style | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
 
         if ex_style != desired {
             SetWindowLongW(hwnd, GWL_EXSTYLE, desired as i32);
@@ -161,7 +159,10 @@ fn apply_window_flags(hwnd: HWND) {
             let _ = SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
             log::debug!("Re-applied HWND_TOPMOST");

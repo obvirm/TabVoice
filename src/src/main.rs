@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 //! Entry point untuk binary `tabvoice`.
 //!
@@ -22,10 +22,8 @@ use tabvoice_lib::{events, hotkey, settings, state as app_state, transcriber, tr
 
 fn main() -> eframe::Result<()> {
     // 1. Init logger (default level `info`, override via RUST_LOG).
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
 
     // 2. Load settings dari %APPDATA%\TabVoice\settings.toml (atau default).
     let settings = settings::load_or_default();
@@ -62,7 +60,10 @@ fn main() -> eframe::Result<()> {
         );
         Some(m)
     } else {
-        log::info!("Memory mode is {:?}. Model will be lazy-loaded.", settings.memory_mode);
+        log::info!(
+            "Memory mode is {:?}. Model will be lazy-loaded.",
+            settings.memory_mode
+        );
         None
     };
 
@@ -95,15 +96,22 @@ fn main() -> eframe::Result<()> {
     Box::leak(Box::new(rt));
 
     // 7. Spawn transcriber worker di tokio runtime.
-    let transcriber = transcriber::Transcriber::new(settings.language.clone(), Arc::clone(&app_state));
+    let transcriber =
+        transcriber::Transcriber::new(settings.language.clone(), Arc::clone(&app_state));
     let event_tx_for_transcriber = event_tx.clone();
     rt_handle.spawn(async move {
-        transcriber.run_loop(release_rx, event_tx_for_transcriber).await;
+        transcriber
+            .run_loop(release_rx, event_tx_for_transcriber)
+            .await;
     });
 
     // 8. Register global hotkey (Ctrl+Shift+Space) dan spawn listener thread.
     //    Listener butuh Arc<AppState> untuk start/stop MicCapture saat press/release.
-    let _hotkey_handle = match hotkey::register_push_to_talk(&settings.hotkey, event_tx.clone(), app_state.clone()) {
+    let _hotkey_handle = match hotkey::register_push_to_talk(
+        &settings.hotkey,
+        event_tx.clone(),
+        app_state.clone(),
+    ) {
         Ok(handle) => Some(handle),
         Err(e) => {
             log::error!("Failed to register hotkey: {e}. Use the mic button in the UI instead.");
@@ -136,14 +144,23 @@ fn main() -> eframe::Result<()> {
     // Start background thread to constantly track the last active window
     tabvoice_lib::focus::spawn_focus_tracker();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_inner_size([52.0, 52.0])
+        .with_resizable(false)
+        .with_taskbar(false);
+    if let Some((rgba, w, h)) = tabvoice_lib::app_icon_rgba() {
+        viewport = viewport.with_icon(std::sync::Arc::new(egui::IconData {
+            rgba,
+            width: w,
+            height: h,
+        }));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_inner_size([52.0, 52.0])
-            .with_resizable(false)
-            .with_taskbar(false),
+        viewport,
         ..Default::default()
     };
 

@@ -1,34 +1,306 @@
-name: Rust
+name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
+    tags: ["v*"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  TABVOICE_NO_CUDA: "1"
+  RUST_BACKTRACE: "1"
 
 jobs:
+  # ------------------------------------------------------------------
+  # Build release binary di 3 OS (CPU-only; CUDA build tetap lokal user)
+  # ------------------------------------------------------------------
   build:
-
-    runs-on: windows-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x64
+            bin: tabvoice.exe
+          - os: ubuntu-latest
+            artifact: linux-x64
+            bin: tabvoice
+          - os: macos-latest
+            artifact: macos-aarch64
+            bin: tabvoice
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v4
-    - uses: ilammy/msvc-dev-cmd@v1
-    
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-      
-    - name: Build CPU version
-      env:
-        TABVOICE_NO_CUDA: "1"
-        LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
-      run: cargo build --release --verbose
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: tabvoice-cpu-only
-        path: target/release/tabvoice.exe
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: MSVC dev cmd (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            libasound2-dev libssl-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-icccm4-dev \
+            libxcb-keysyms1-dev libxkbcommon-dev \
+            libgl1-mesa-dri libegl1-mesa libgl1 \
+            libxdo-dev \
+            libgtk-3-dev libappindicator3-dev
+
+      - name: Cache whisper model
+        uses: actions/cache@v4
+        with:
+          path: models/ggml-base.bin
+          key: models-ggml-base-v1
+
+      - name: Download whisper model (ggml-base.bin, embedded di binary)
+        shell: bash
+        run: |
+          mkdir -p models
+          if [ ! -s models/ggml-base.bin ]; then
+            curl -fL --retry 3 -o models/ggml-base.bin \
+              https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+          fi
+          ls -la models/
+
+      - name: Build release
+        run: cargo build --release --verbose
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\target\release\tabvoice.exe" -PassThru `
+            -RedirectStandardOutput "smoke.log" -RedirectStandardError "smoke_err.log"
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) {
+            Write-Error "SMOKE FAIL: app exited early (code $($p.ExitCode))"
+            if (Test-Path smoke.log) { Get-Content smoke.log }
+            if (Test-Path smoke_err.log) { Get-Content smoke_err.log }
+            exit 1
+          }
+          Write-Output "SMOKE OK: app alive after 20s"
+          Stop-Process -Id $p.Id -Force
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ./target/release/tabvoice > smoke.log 2>&1 &
+          PID=$!
+          sleep 20
+          if kill -0 $PID 2>/dev/null; then
+            echo "SMOKE OK: app alive after 20s"
+            kill $PID
+          else
+            echo "SMOKE FAIL: app exited early"
+            cat smoke.log
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # E2E Linux: tes beneran — virtual mic + hotkey simulasi + WAV whisper.cpp
+  # ------------------------------------------------------------------
+  e2e-linux:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install test deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb xdotool xclip \
+            pulseaudio pulseaudio-utils \
+            libasound2-plugins alsa-utils \
+            ffmpeg \
+            libgtk-3-0 libappindicator3-1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x64
+          path: bin
+
+      - name: Setup virtual audio (PulseAudio null sink + ALSA bridge)
+        shell: bash
+        run: |
+          chmod +x bin/tabvoice
+
+          # ALSA default -> PulseAudio (cpal pakai ALSA)
+          mkdir -p ~/.config/pulse
+          cat > ~/.asoundrc <<'EOF'
+          pcm.!default {
+              type pulse
+          }
+          ctl.!default {
+              type pulse
+          }
+          EOF
+
+          # Start PulseAudio tanpa dbus
+          export XDG_RUNTIME_DIR=/tmp/xdg-runtime
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          pulseaudio -D --exit-idle-time=-1 --disallow-exit
+
+          # Null sink = virtual mic; monitor-nya jadi default source
+          pactl load-module module-null-sink sink_name=vsink \
+            sink_properties=device.description=VirtualMic
+          pactl set-default-sink vsink
+          pactl set-default-source vsink.monitor
+          pactl info | grep "Default Source"
+
+      - name: Run E2E (xvfb + hotkey + WAV via FFmpeg)
+        shell: bash
+        run: |
+          export XDG_RUNTIME_DIR=/tmp/xdg-runtime
+          export DISPLAY=:99
+
+          # Pastikan WAV contoh whisper.cpp ada (submodule)
+          WAV=third_party/whisper.cpp/samples/jfk.wav
+          test -f "$WAV" || { echo "E2E FAIL: $WAV tidak ada (submodule belum ke-checkout?)"; exit 1; }
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WAV")
+          echo "WAV duration: ${DUR}s"
+
+          # 1. Launch app di Xvfb
+          Xvfb :99 -screen 0 1280x800x24 &
+          XVFB_PID=$!
+          sleep 2
+
+          RUST_LOG=info ./bin/tabvoice > app.log 2>&1 &
+          APP_PID=$!
+
+          # 2. Tunggu startup (hotkey terdaftar)
+          for i in $(seq 1 30); do
+            if grep -q "startup complete" app.log 2>/dev/null; then
+              echo "App started (${i}s)"
+              break
+            fi
+            sleep 1
+          done
+          grep -q "startup complete" app.log || { echo "E2E FAIL: app tidak pernah startup"; cat app.log; exit 1; }
+          sleep 3
+
+          # 3. Tekan & TAHAN hotkey (Ctrl+Shift+Space) -> mulai rekam.
+          #    (xdotool key = press+release instan -> rekaman kosong;
+          #     harus keydown, tunggu audio selesai, baru keyup.)
+          xdotool keydown --clearmodifiers ctrl+shift+space
+          sleep 2
+          grep -q "MicCapture started" app.log || { echo "E2E FAIL: hotkey press tidak tertangkap"; cat app.log; exit 1; }
+
+          # 4. Putar WAV ke virtual mic (sink vsink)
+          ffmpeg -re -i "$WAV" -f pulse vsink -loglevel error &
+          FFMPEG_PID=$!
+          wait $FFMPEG_PID
+          echo "WAV selesai diputar"
+
+          # 5. Lepas hotkey -> stop rekam -> transkripsi
+          sleep 1
+          xdotool keyup --clearmodifiers ctrl+shift+space
+
+          # 6. Tunggu hasil transkripsi (max 60s)
+          for i in $(seq 1 60); do
+            if grep -q "Transcription OK" app.log 2>/dev/null; then
+              echo "E2E: transcription muncul setelah ${i}s"
+              break
+            fi
+            if grep -q "No speech detected" app.log 2>/dev/null; then
+              echo "E2E FAIL: 'No speech detected' muncul"
+              cat app.log
+              kill $APP_PID $XVFB_PID 2>/dev/null
+              exit 1
+            fi
+            sleep 1
+          done
+
+          kill $APP_PID $XVFB_PID 2>/dev/null
+
+          if ! grep -q "Transcription OK" app.log; then
+            echo "E2E FAIL: tidak ada transkripsi dalam 60s"
+            cat app.log
+            exit 1
+          fi
+
+          # 7. Verifikasi teks non-kosong (bukan "No speech detected")
+          TXT=$(grep -oP 'Transcription OK \([0-9]+ chars\): \K.*' app.log | tail -1)
+          echo "HASIL TRANSKRIPSI: $TXT"
+          if [ -z "$TXT" ] || [ "$TXT" = "" ]; then
+            echo "E2E FAIL: hasil transkripsi kosong"
+            exit 1
+          fi
+          echo "E2E PASS"
+
+      - name: Upload E2E log (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-linux-logs
+          path: |
+            app.log
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Release: hanya saat tag v* di-push (setelah user ACC)
+  # ------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, e2e-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+
+          # Windows -> zip
+          (cd artifacts/windows-x64 && zip -q ../tabvoice-windows-x64.zip tabvoice.exe)
+          mv artifacts/tabvoice-windows-x64.zip dist/
+
+          # Linux -> tar.gz
+          (cd artifacts/linux-x64 && tar czf ../tabvoice-linux-x64.tar.gz tabvoice)
+          mv artifacts/tabvoice-linux-x64.tar.gz dist/
+
+          # macOS -> tar.gz
+          (cd artifacts/macos-aarch64 && tar czf ../tabvoice-macos-aarch64.tar.gz tabvoice)
+          mv artifacts/tabvoice-macos-aarch64.tar.gz dist/
+
+          cp media/logo.png dist/tabvoice-logo.png
+          ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/tabvoice-windows-x64.zip
+            dist/tabvoice-linux-x64.tar.gz
+            dist/tabvoice-macos-aarch64.tar.gz
+            dist/tabvoice-logo.png
+          generate_release_notes: true
+          fail_on_unmatched_files: true

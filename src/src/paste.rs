@@ -32,8 +32,8 @@ pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
 #[cfg(windows)]
 pub fn send_paste() -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_V,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        VIRTUAL_KEY, VK_CONTROL, VK_V,
     };
 
     // 4 INPUT events: Ctrl down, V down, V up, Ctrl up.
@@ -87,12 +87,7 @@ pub fn send_paste() -> anyhow::Result<()> {
     };
 
     let inputs = [ctrl_down, v_down, v_up, ctrl_up];
-    let sent = unsafe {
-        SendInput(
-            &inputs,
-            std::mem::size_of::<INPUT>() as i32,
-        )
-    };
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 
     if sent as usize != inputs.len() {
         anyhow::bail!(
@@ -112,12 +107,12 @@ pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
         return Ok(());
     }
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK, VK_LEFT, VK_SHIFT,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        VIRTUAL_KEY, VK_BACK, VK_LEFT, VK_SHIFT,
     };
 
     let mut inputs = Vec::with_capacity(count * 2 + 4);
-    
+
     // Shift down
     inputs.push(INPUT {
         r#type: INPUT_KEYBOARD,
@@ -173,7 +168,7 @@ pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
             },
         },
     });
-    
+
     // Backspace
     inputs.push(INPUT {
         r#type: INPUT_KEYBOARD,
@@ -200,33 +195,22 @@ pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
         },
     });
 
-    let sent = unsafe {
-        SendInput(
-            &inputs,
-            std::mem::size_of::<INPUT>() as i32,
-        )
-    };
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 
     if sent as usize != inputs.len() {
-        anyhow::bail!("SendInput hanya mengirim {sent} dari {} events backspace", inputs.len());
+        anyhow::bail!(
+            "SendInput hanya mengirim {sent} dari {} events backspace",
+            inputs.len()
+        );
     }
-    
+
     // Beri waktu OS untuk memproses event hapus sebelum kita kirim Ctrl+V
     thread::sleep(Duration::from_millis(20));
     Ok(())
 }
 
-/// Stub non-Windows: TabVoice target Windows, tapi sediakan stub agar
-/// `cargo check` di host non-Windows tidak fail.
-#[cfg(not(windows))]
-pub fn send_paste() -> anyhow::Result<()> {
-    anyhow::bail!("send_paste hanya diimplementasi untuk Windows")
-}
-
-#[cfg(not(windows))]
-pub fn send_backspaces(_count: usize) -> anyhow::Result<()> {
-    anyhow::bail!("send_backspaces hanya diimplementasi untuk Windows")
-}
+/// Stub non-Windows dihapus: `send_paste` & `send_backspaces`
+/// diimplementasi pakai `enigo` di bawah (cross-platform keyboard input).
 
 /// Convenience: copy ke clipboard + sleep 30ms + kirim Ctrl+V.
 ///
@@ -254,7 +238,7 @@ pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
     if count == 0 {
         return Ok(());
     }
-    use enigo::{Enigo, Keyboard, Key, Settings};
+    use enigo::{Enigo, Key, Keyboard, Settings};
     let mut enigo = Enigo::new(&Settings::default())?;
     for _ in 0..count {
         enigo.key(Key::Backspace, enigo::Direction::Click)?;
@@ -264,19 +248,19 @@ pub fn send_backspaces(count: usize) -> anyhow::Result<()> {
 
 #[cfg(not(windows))]
 fn send_paste() -> anyhow::Result<()> {
-    use enigo::{Enigo, Keyboard, Key, Settings};
+    use enigo::{Enigo, Key, Keyboard, Settings};
     let mut enigo = Enigo::new(&Settings::default())?;
-    
+
     // Ctrl+V for Linux, Cmd+V for macOS
     #[cfg(target_os = "macos")]
     let modifier = Key::Meta;
     #[cfg(not(target_os = "macos"))]
     let modifier = Key::Control;
-    
+
     enigo.key(modifier, enigo::Direction::Press)?;
     enigo.key(Key::Unicode('v'), enigo::Direction::Click)?;
     enigo.key(modifier, enigo::Direction::Release)?;
-    
+
     Ok(())
 }
 

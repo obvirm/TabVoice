@@ -11,8 +11,8 @@
 //! (hidup terus selama proses); ganti shortcut lewat [`reregister_hotkey`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -85,21 +85,21 @@ pub fn register_push_to_talk(
     state: Arc<AppState>,
 ) -> Result<HotkeyHandle> {
     let manager = HOTKEY_MANAGER.get_or_init(|| {
-        let mgr = GlobalHotKeyManager::new()
-            .expect("Gagal membuat GlobalHotKeyManager");
+        let mgr = GlobalHotKeyManager::new().expect("Gagal membuat GlobalHotKeyManager");
         SendSyncManager(Mutex::new(Some(mgr)))
     });
     let mgr_guard = manager.lock();
     let hotkey = parse_hotkey_string(hotkey_str)
         .ok_or_else(|| anyhow::anyhow!("Format hotkey tidak valid: {}", hotkey_str))?;
     let hotkey_id = hotkey.id();
-    mgr_guard.as_ref().unwrap().register(hotkey)
+    mgr_guard
+        .as_ref()
+        .unwrap()
+        .register(hotkey)
         .with_context(|| format!("Gagal mendaftarkan hotkey id={}", hotkey_id))?;
     drop(mgr_guard);
 
-    *CURRENT_HOTKEY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(hotkey);
+    *CURRENT_HOTKEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(hotkey);
 
     log::info!("Hotkey terdaftar: {} (id={})", hotkey_str, hotkey_id);
 
@@ -215,7 +215,11 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
                 };
                 rec.samples.extend(samples);
 
-                let is_realtime = state_cb.settings.lock().map(|s| s.realtime).unwrap_or(false);
+                let is_realtime = state_cb
+                    .settings
+                    .lock()
+                    .map(|s| s.realtime)
+                    .unwrap_or(false);
                 if is_realtime {
                     let len = rec.samples.len();
                     // 1600 samples pada 16kHz = 100 ms
@@ -228,7 +232,9 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
             if let Some(partial_samples) = emit_partial {
                 if let Ok(guard) = state_cb.release_tx.lock() {
                     if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(crate::transcriber::TranscriberInput::Partial(partial_samples));
+                        let _ = tx.send(crate::transcriber::TranscriberInput::Partial(
+                            partial_samples,
+                        ));
                     }
                 }
             }
@@ -240,15 +246,22 @@ pub fn handle_press(event_tx: &EventSender, state: &Arc<AppState>) {
     //    Kalau device detection gagal, fallback ke 48000 Hz / 1 channel (mono mic)
     //    — MicCapture::start_capture akan tetap mencoba query device-nya sendiri,
     //    jadi hint ini cuma untuk logging.
-    let (hint_rate, hint_channels) =
-        detect_default_input_config().unwrap_or((48_000, 1));
-        
-    let device_name = state.settings.lock().unwrap_or_else(|e| e.into_inner()).device_name.clone();
+    let (hint_rate, hint_channels) = detect_default_input_config().unwrap_or((48_000, 1));
+
+    let device_name = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .device_name
+        .clone();
 
     // 4. Start MicCapture dengan callback wrapper.
-    let capture = match audio::start_capture(hint_rate, hint_channels, device_name.as_deref(), move |s, r| {
-        on_samples(s, r)
-    }) {
+    let capture = match audio::start_capture(
+        hint_rate,
+        hint_channels,
+        device_name.as_deref(),
+        move |s, r| on_samples(s, r),
+    ) {
         Ok(c) => c,
         Err(e) => {
             log::error!("Hotkey press: gagal start MicCapture: {e}");
@@ -303,7 +316,12 @@ pub fn handle_release(event_tx: &EventSender, state: &Arc<AppState>) {
     );
 
     // 3. Kirim ke transcriber worker kalau channel masih hidup.
-    if let Some(tx) = state.release_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+    if let Some(tx) = state
+        .release_tx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
         if let Err(e) = tx.send(crate::transcriber::TranscriberInput::Final(samples)) {
             log::warn!("Gagal kirim samples ke release_tx (transcriber sudah drop?): {e}");
         }
@@ -312,7 +330,11 @@ pub fn handle_release(event_tx: &EventSender, state: &Arc<AppState>) {
     }
 
     // 4. Set is_recording = false.
-    state.recorder.lock().unwrap_or_else(|e| e.into_inner()).is_recording = false;
+    state
+        .recorder
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_recording = false;
 
     // 5. Emit Amplitude 0.0 untuk reset waveform UI.
     let _ = event_tx.send(AppEvent::Amplitude { value: 0.0 });
@@ -486,7 +508,10 @@ pub fn reregister_hotkey(hotkey_str: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Format hotkey tidak valid: {}", hotkey_str))?;
 
     // Batalkan pendaftaran hotkey lama (best-effort).
-    let old = CURRENT_HOTKEY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let old = CURRENT_HOTKEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(old) = old {
         if let Some(m) = mgr.lock().as_mut() {
             let _ = m.unregister(old);
@@ -518,13 +543,19 @@ mod tests {
     #[test]
     fn parse_default_chord() {
         let hk = parse_hotkey_string("Ctrl+Shift+Space").expect("should parse");
-        assert_eq!(hk.id(), HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space).id());
+        assert_eq!(
+            hk.id(),
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space).id()
+        );
     }
 
     #[test]
     fn parse_lowercase() {
         let hk = parse_hotkey_string("shift+space").expect("should parse");
-        assert_eq!(hk.id(), HotKey::new(Some(Modifiers::SHIFT), Code::Space).id());
+        assert_eq!(
+            hk.id(),
+            HotKey::new(Some(Modifiers::SHIFT), Code::Space).id()
+        );
     }
 
     #[test]

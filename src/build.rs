@@ -1,4 +1,7 @@
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -37,7 +40,10 @@ fn main() {
             let new_path = env::join_paths(&paths).unwrap();
             env::set_var("PATH", &new_path);
             env::set_var("CMAKE", &cmake_exe);
-            println!("cargo:warning=cmake auto-detected at {}", cmake_exe.display());
+            println!(
+                "cargo:warning=cmake auto-detected at {}",
+                cmake_exe.display()
+            );
         } else {
             panic!(
                 "cmake tidak ditemukan di PATH dan tidak ada di Visual Studio Build Tools. \
@@ -56,7 +62,18 @@ fn main() {
         env::set_var("PATH", &new_path);
     }
 
-    let use_cuda = env::var("TABVOICE_NO_CUDA").unwrap_or_else(|_| "0".to_string()) != "1";
+    // CUDA aktif HANYA kalau tidak di-disable via env DAN toolkit terdeteksi.
+    // Di Windows: cek CUDA_PATH / folder NVIDIA Toolkit.
+    // Di Linux/macOS: cek `nvcc` di PATH atau CUDA_PATH (default off kalau tidak ada).
+    let no_cuda_env = env::var("TABVOICE_NO_CUDA").unwrap_or_else(|_| "0".to_string()) == "1";
+    let use_cuda = !no_cuda_env && cuda_toolkit_detected();
+    if use_cuda {
+        println!("cargo:warning=CUDA toolkit detected - building with GGML_CUDA=ON");
+    } else if no_cuda_env {
+        println!("cargo:warning=TABVOICE_NO_CUDA=1 - building CPU-only");
+    } else {
+        println!("cargo:warning=CUDA toolkit not detected - building CPU-only (set TABVOICE_NO_CUDA=0 + CUDA_PATH/nvcc to enable)");
+    }
 
     let mut cfg = cmake::Config::new(&whisper_src);
     cfg.generator("Ninja")
@@ -66,7 +83,16 @@ fn main() {
         .define("WHISPER_BUILD_SERVER", "OFF")
         .define("WHISPER_OPENVINO", "OFF")
         .define("WHISPER_COREML", "OFF");
-        
+
+    // Linux: GCC auto-detect OpenMP di ggml-cpu -> symbol GOMP_* yang
+    // tidak ter-link oleh Rust (butuh libgomp eksternal). macOS: AppleClang
+    // tidak punya OpenMP bawaan. Matikan OpenMP di non-Windows biar build
+    // portable tanpa dependency tambahan (Windows tetap pakai OpenMP MSVC
+    // seperti sekarang).
+    if !cfg!(windows) {
+        cfg.define("GGML_OPENMP", "OFF");
+    }
+
     if use_cuda {
         cfg.define("GGML_CUDA", "ON"); // Aktifkan GPU / CUDA Support
     }
@@ -85,7 +111,12 @@ fn main() {
 
     if cfg!(windows) && use_cuda {
         let mut cuda_path = env::var("CUDA_PATH").unwrap_or_default();
-        if !Path::new(&cuda_path).join("lib").join("x64").join("cudart.lib").exists() {
+        if !Path::new(&cuda_path)
+            .join("lib")
+            .join("x64")
+            .join("cudart.lib")
+            .exists()
+        {
             // Coba hardcode ke v13.2 kalau CUDA_PATH nyangkut di versi lama
             cuda_path = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2".to_string();
         }
@@ -116,7 +147,10 @@ fn main() {
         fs::copy(&pregen, &out_path).expect("copy pre-generated whisper_bindings.rs");
         println!("cargo:warning=Using pre-generated whisper_bindings.rs (skip bindgen)");
     } else {
-        panic!("whisper_bindings.rs not found at {}; run build on Linux first to generate it", pregen.display());
+        panic!(
+            "whisper_bindings.rs not found at {}; run build on Linux first to generate it",
+            pregen.display()
+        );
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -126,7 +160,7 @@ fn main() {
         if let Err(e) = fs::copy(&icon_src, &out) {
             panic!("Failed to copy tray_icon.ico to OUT_DIR: {e}");
         }
-        
+
         #[cfg(windows)]
         {
             let mut res = winres::WindowsResource::new();
@@ -136,6 +170,42 @@ fn main() {
             }
         }
     }
+}
+
+/// Deteksi keberadaan CUDA toolkit (nvcc di PATH atau CUDA_PATH / folder umum).
+fn cuda_toolkit_detected() -> bool {
+    if env::var_os("CUDA_PATH").is_some() {
+        return true;
+    }
+    // nvcc di PATH (Linux/macOS, atau Windows dengan CUDA bin di PATH)
+    if which("nvcc").is_some() {
+        return true;
+    }
+    // Lokasi umum Windows
+    let program_files = env::var_os("ProgramFiles").unwrap_or_default();
+    let cuda_root = Path::new(&program_files)
+        .join("NVIDIA GPU Computing Toolkit")
+        .join("CUDA");
+    if cuda_root.is_dir() {
+        return true;
+    }
+    false
+}
+
+/// Check apakah `name` (mis. nvcc) ada di PATH.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        });
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Check apakah `cmake` ada di PATH.
@@ -153,15 +223,18 @@ fn which_cmake() -> Option<PathBuf> {
 /// Cari direktori berisi `libclang.dll` di lokasi umum Windows.
 #[cfg(windows)]
 fn find_libclang_dir() -> Option<PathBuf> {
-    let program_files =
-        env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
+    let program_files = env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
     let program_files_x86 =
         env::var_os("ProgramFiles(x86)").unwrap_or_else(|| "C:\\Program Files (x86)".into());
     let username = env::var_os("USERNAME")
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let libclang_name = if cfg!(windows) { "libclang.dll" } else { "libclang.so" };
+    let libclang_name = if cfg!(windows) {
+        "libclang.dll"
+    } else {
+        "libclang.so"
+    };
     let candidates: Vec<PathBuf> = vec![
         PathBuf::from(&program_files).join("LLVM").join("bin"),
         PathBuf::from("C:\\Users")

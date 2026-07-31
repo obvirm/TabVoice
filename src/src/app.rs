@@ -10,7 +10,8 @@ use crate::state::AppState;
 pub const AMP_HISTORY_LEN: usize = 40;
 pub const WAVEFORM_BARS: usize = 3;
 
-pub static IS_ASSIGNING_HOTKEY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static IS_ASSIGNING_HOTKEY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiMode {
@@ -29,7 +30,7 @@ pub struct TabVoice {
     pub fade_timer: u32,
     pub available_models: Vec<String>,
     pub available_microphones: Vec<String>,
-    
+
     // Settings state
     pub temp_model_path: String,
     pub temp_language: String,
@@ -41,7 +42,9 @@ pub struct TabVoice {
     pub temp_auto_start: bool,
     pub temp_memory_mode: crate::settings::MemoryMode,
     pub temp_vad_threshold: f32,
-    
+    pub temp_vad_enabled: bool,
+    pub temp_boost_gain: f32,
+
     pub current_window_size: egui::Vec2,
     pub download_progress: Option<f32>,
     pub assigning_hotkey: bool,
@@ -78,6 +81,8 @@ impl TabVoice {
             temp_auto_start: false,
             temp_memory_mode: crate::settings::MemoryMode::LoadOnFirstUse,
             temp_vad_threshold: 0.005,
+            temp_vad_enabled: true,
+            temp_boost_gain: 1.0,
             current_window_size: egui::vec2(48.0, 48.0),
             download_progress: None,
             assigning_hotkey: false,
@@ -133,7 +138,13 @@ impl TabVoice {
             AppEvent::DownloadComplete => {
                 self.download_progress = None;
                 // Download selesai, load model ke memory di background thread
-                let current_model_path = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).model_path.clone();
+                let current_model_path = self
+                    .state
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .model_path
+                    .clone();
                 self.load_model_in_background(current_model_path);
             }
             AppEvent::ModelReloaded { path } => {
@@ -151,38 +162,52 @@ impl TabVoice {
                 if self.download_progress.is_some() {
                     return; // Abaikan, sedang proses download
                 }
-                
-                let current_model_path = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).model_path.clone();
+
+                let current_model_path = self
+                    .state
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .model_path
+                    .clone();
                 if current_model_path.exists() {
                     self.load_model_in_background(current_model_path);
                 } else {
-                    let model_name = current_model_path.file_name().and_then(|n| n.to_str()).unwrap_or("ggml-base.bin").to_string();
+                    let model_name = current_model_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("ggml-base.bin")
+                        .to_string();
                     let url = format!(
                         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
                         model_name
                     );
                     self.download_progress = Some(0.0);
                     let tx = self.event_tx.clone();
-                    
+
                     std::thread::spawn(move || {
                         let rt = match tokio::runtime::Runtime::new() {
                             Ok(rt) => rt,
                             Err(e) => {
-                                let _ = tx.send(AppEvent::Error { message: format!("Gagal membuat async runtime: {}", e) });
+                                let _ = tx.send(AppEvent::Error {
+                                    message: format!("Gagal membuat async runtime: {}", e),
+                                });
                                 return;
                             }
                         };
                         rt.block_on(async move {
                             let temp_path = current_model_path.with_extension("bin.download");
                             let mut start_byte = 0;
-                            
+
                             if let Ok(metadata) = std::fs::metadata(&temp_path) {
                                 start_byte = metadata.len();
                             }
-                            
+
                             let client = reqwest::Client::new();
                             let req = if start_byte > 0 {
-                                client.get(&url).header("Range", format!("bytes={}-", start_byte))
+                                client
+                                    .get(&url)
+                                    .header("Range", format!("bytes={}-", start_byte))
                             } else {
                                 client.get(&url)
                             };
@@ -190,7 +215,9 @@ impl TabVoice {
                             if let Ok(mut resp) = req.send().await {
                                 let status = resp.status();
                                 // Jika server tidak support Range, dia akan balas 200 OK
-                                if status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                                if status.is_success()
+                                    && status != reqwest::StatusCode::PARTIAL_CONTENT
+                                {
                                     start_byte = 0; // Reset ke 0
                                 }
 
@@ -200,13 +227,13 @@ impl TabVoice {
                                     resp.content_length().unwrap_or(0)
                                 };
                                 let total = total_size as f32;
-                                
+
                                 let mut downloaded = start_byte as f32;
-                                
+
                                 if let Some(parent) = current_model_path.parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
-                                
+
                                 let file_result = if start_byte > 0 {
                                     std::fs::OpenOptions::new().append(true).open(&temp_path)
                                 } else {
@@ -225,7 +252,9 @@ impl TabVoice {
                                                 }
                                                 downloaded += chunk.len() as f32;
                                                 if total > 0.0 {
-                                                    let _ = tx.send(AppEvent::DownloadProgress { progress: downloaded / total });
+                                                    let _ = tx.send(AppEvent::DownloadProgress {
+                                                        progress: downloaded / total,
+                                                    });
                                                 }
                                             }
                                             Ok(None) => {
@@ -237,19 +266,27 @@ impl TabVoice {
                                             }
                                         }
                                     }
-                                    
+
                                     // Jika berhasil sampai akhir, rename!
                                     if success && (total == 0.0 || downloaded >= total) {
                                         let _ = std::fs::rename(&temp_path, &current_model_path);
                                         let _ = tx.send(AppEvent::DownloadComplete);
                                     } else {
-                                        let _ = tx.send(AppEvent::Error { message: "Koneksi terputus! Klik Save lagi untuk resume.".into() });
+                                        let _ = tx.send(AppEvent::Error {
+                                            message:
+                                                "Koneksi terputus! Klik Save lagi untuk resume."
+                                                    .into(),
+                                        });
                                     }
                                 } else {
-                                    let _ = tx.send(AppEvent::Error { message: "Gagal membuat file temporary.".into() });
+                                    let _ = tx.send(AppEvent::Error {
+                                        message: "Gagal membuat file temporary.".into(),
+                                    });
                                 }
                             } else {
-                                let _ = tx.send(AppEvent::Error { message: "Gagal menghubungi server.".into() });
+                                let _ = tx.send(AppEvent::Error {
+                                    message: "Gagal menghubungi server.".into(),
+                                });
                             }
                         });
                     });
@@ -259,24 +296,34 @@ impl TabVoice {
                 self.mode = UiMode::Settings;
                 self.available_models = list_available_models();
                 self.available_microphones = crate::audio::get_available_microphones();
-                let current = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                
-                let model_filename = current.model_path
+                let current = self
+                    .state
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+
+                let model_filename = current
+                    .model_path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("ggml-base.bin")
                     .to_string();
                 self.temp_model_path = model_filename;
-                
+
                 self.temp_language = current.language.unwrap_or_else(|| "auto".to_string());
                 self.temp_hotkey = current.hotkey.clone();
                 self.temp_paste = current.paste_on_release;
-                self.temp_device_name = current.device_name.unwrap_or_else(|| "System Default".to_string());
+                self.temp_device_name = current
+                    .device_name
+                    .unwrap_or_else(|| "System Default".to_string());
                 self.temp_dark_mode = current.dark_mode;
                 self.temp_realtime = current.realtime;
                 self.temp_auto_start = current.auto_start;
                 self.temp_memory_mode = current.memory_mode;
                 self.temp_vad_threshold = current.vad_threshold;
+                self.temp_vad_enabled = current.vad_enabled;
+                self.temp_boost_gain = current.boost_gain;
             }
             TrayAction::Quit => {
                 std::process::exit(0);
@@ -296,14 +343,21 @@ impl TabVoice {
                     Ok(new_model) => {
                         log::info!("Model loaded successfully: {:?}", path);
                         // Update state.model dengan model baru
-                        *state.model.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(new_model));
+                        *state.model.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(std::sync::Arc::new(new_model));
                         // Increment generation biar transcriber tahu model diganti
-                        state.model_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let _ = tx.send(AppEvent::ModelReloaded { path: path.to_string_lossy().to_string() });
+                        state
+                            .model_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = tx.send(AppEvent::ModelReloaded {
+                            path: path.to_string_lossy().to_string(),
+                        });
                     }
                     Err(e) => {
                         log::error!("Failed to load model from {:?}: {}", path, e);
-                        let _ = tx.send(AppEvent::Error { message: format!("Gagal memuat model: {}", e) });
+                        let _ = tx.send(AppEvent::Error {
+                            message: format!("Gagal memuat model: {}", e),
+                        });
                     }
                 }
             })
@@ -318,8 +372,13 @@ impl eframe::App for TabVoice {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let is_dark = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).dark_mode;
-        
+        let is_dark = self
+            .state
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dark_mode;
+
         // Set egui global visuals
         if is_dark {
             ctx.set_visuals(egui::Visuals::dark());
@@ -351,11 +410,19 @@ impl eframe::App for TabVoice {
             UiMode::Settings => egui::vec2(480.0, 420.0),
             UiMode::Idle => egui::vec2(52.0, 52.0),
             UiMode::Recording => {
-                if self.text.is_empty() { egui::vec2(144.0, 52.0) } else { egui::vec2(284.0, 52.0) }
-            },
+                if self.text.is_empty() {
+                    egui::vec2(144.0, 52.0)
+                } else {
+                    egui::vec2(284.0, 52.0)
+                }
+            }
             UiMode::Processing => {
-                if self.text.is_empty() { egui::vec2(144.0, 52.0) } else { egui::vec2(284.0, 52.0) }
-            },
+                if self.text.is_empty() {
+                    egui::vec2(144.0, 52.0)
+                } else {
+                    egui::vec2(284.0, 52.0)
+                }
+            }
             UiMode::Done => egui::vec2(284.0, 52.0),
         };
 
@@ -369,24 +436,34 @@ impl eframe::App for TabVoice {
             .fill(egui::Color32::TRANSPARENT)
             .inner_margin(0.0);
 
-        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-            if self.mode == UiMode::Settings {
-                self.show_settings(ctx, ui, frame);
-            } else {
-                self.show_pill(ctx, ui, frame);
-            }
-        });
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(ctx, |ui| {
+                if self.mode == UiMode::Settings {
+                    self.show_settings(ctx, ui, frame);
+                } else {
+                    self.show_pill(ctx, ui, frame);
+                }
+            });
 
         if prev_mode != self.mode {
             let next_target = match self.mode {
                 UiMode::Settings => egui::vec2(480.0, 420.0),
                 UiMode::Idle => egui::vec2(52.0, 52.0),
                 UiMode::Recording => {
-                    if self.text.is_empty() { egui::vec2(144.0, 52.0) } else { egui::vec2(284.0, 52.0) }
-                },
+                    if self.text.is_empty() {
+                        egui::vec2(144.0, 52.0)
+                    } else {
+                        egui::vec2(284.0, 52.0)
+                    }
+                }
                 UiMode::Processing => {
-                    if self.text.is_empty() { egui::vec2(144.0, 52.0) } else { egui::vec2(284.0, 52.0) }
-                },
+                    if self.text.is_empty() {
+                        egui::vec2(144.0, 52.0)
+                    } else {
+                        egui::vec2(284.0, 52.0)
+                    }
+                }
                 UiMode::Done => egui::vec2(284.0, 52.0),
             };
             if self.current_window_size != next_target {
@@ -405,22 +482,34 @@ impl TabVoice {
         // Container utama pill, di-shrink sedikit agar outline (stroke) tidak terpotong tepi window
         let pill_rect = egui::Rect::from_center_size(
             ui.max_rect().center(),
-            egui::vec2(ui.max_rect().width().min(284.0), ui.max_rect().height().min(52.0))
-        ).shrink(2.0);
+            egui::vec2(
+                ui.max_rect().width().min(284.0),
+                ui.max_rect().height().min(52.0),
+            ),
+        )
+        .shrink(2.0);
 
-        let mut ui = ui.child_ui(pill_rect, egui::Layout::centered_and_justified(egui::Direction::LeftToRight));
+        let mut ui = ui.child_ui(
+            pill_rect,
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        );
 
-        let is_dark = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).dark_mode;
-        
+        let is_dark = self
+            .state
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dark_mode;
+
         let (bg_color, _stroke_color) = if is_dark {
             (
                 egui::Color32::from_rgba_unmultiplied(30, 30, 30, 235),
-                egui::Color32::from_rgba_unmultiplied(100, 150, 255, 217)
+                egui::Color32::from_rgba_unmultiplied(100, 150, 255, 217),
             )
         } else {
             (
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235),
-                egui::Color32::from_rgba_unmultiplied(64, 115, 217, 217)
+                egui::Color32::from_rgba_unmultiplied(64, 115, 217, 217),
             )
         };
 
@@ -443,7 +532,8 @@ impl TabVoice {
                 ui.spacing_mut().item_spacing.x = 8.0;
 
                 // Drag window with pill
-                let interact = ui.interact(ui.max_rect(), ui.id().with("drag"), egui::Sense::drag());
+                let interact =
+                    ui.interact(ui.max_rect(), ui.id().with("drag"), egui::Sense::drag());
                 if interact.dragged() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
@@ -479,9 +569,12 @@ impl TabVoice {
                             } else {
                                 self.text.clone()
                             };
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(display).color(text_color).size(13.0)
-                            ).truncate(true));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(display).color(text_color).size(13.0),
+                                )
+                                .truncate(true),
+                            );
                         }
                     }
                     UiMode::Processing => {
@@ -494,22 +587,30 @@ impl TabVoice {
                             } else {
                                 self.text.clone()
                             };
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(display).color(text_color).size(13.0)
-                            ).truncate(true));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(display).color(text_color).size(13.0),
+                                )
+                                .truncate(true),
+                            );
                         }
                     }
                     UiMode::Done => {
-                        let color = if self.text.starts_with("Error:") { text_err } else { text_color };
+                        let color = if self.text.starts_with("Error:") {
+                            text_err
+                        } else {
+                            text_color
+                        };
                         let display = if self.text.chars().count() > 60 {
                             let truncated: String = self.text.chars().take(60).collect();
                             format!("{}…", truncated)
                         } else {
                             self.text.clone()
                         };
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(display).color(color).size(13.0)
-                        ).truncate(true));
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(display).color(color).size(13.0))
+                                .truncate(true),
+                        );
                     }
                     UiMode::Settings => {}
                 }
@@ -517,9 +618,23 @@ impl TabVoice {
         });
 
         let (model_name, is_loaded) = {
-            let settings = self.state.settings.lock().unwrap_or_else(|e| e.into_inner());
-            let name = settings.model_path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown").to_string();
-            let loaded = self.state.model.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            let settings = self
+                .state
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let name = settings
+                .model_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let loaded = self
+                .state
+                .model
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
             (name, loaded)
         };
         let tooltip = if is_loaded {
@@ -527,7 +642,7 @@ impl TabVoice {
         } else {
             format!("Model: {} (Standby)", model_name)
         };
-        
+
         let pill_response = response.response.on_hover_text(tooltip);
 
         // Kalau mic area di klik, toggle recording
@@ -545,7 +660,8 @@ impl TabVoice {
     }
 
     fn draw_mic(&self, ui: &mut egui::Ui, color: egui::Color32) {
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+        let (rect, _response) =
+            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
         let cx = rect.center().x;
         let cy = rect.center().y;
         let scale = 18.0 / 24.0;
@@ -562,16 +678,20 @@ impl TabVoice {
                 let angle = start_angle + t * (end_angle - start_angle);
                 arc_path.push(egui::pos2(cx + r * angle.cos(), cy + r * angle.sin()));
             }
-            ui.painter().add(egui::Shape::line(arc_path, egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 255, 150))));
+            ui.painter().add(egui::Shape::line(
+                arc_path,
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 255, 150)),
+            ));
         }
 
         let cap_w = 5.0 * scale;
         let cap_h = 10.0 * scale;
         let cap_rect = egui::Rect::from_center_size(
             egui::pos2(cx, cy - 2.0 * scale),
-            egui::vec2(cap_w, cap_h)
+            egui::vec2(cap_w, cap_h),
         );
-        ui.painter().rect_stroke(cap_rect, cap_w * 0.5, egui::Stroke::new(1.5 * scale, color));
+        ui.painter()
+            .rect_stroke(cap_rect, cap_w * 0.5, egui::Stroke::new(1.5 * scale, color));
 
         let mut cup_path = vec![
             egui::pos2(cx - 5.5 * scale, cy - 2.0 * scale),
@@ -585,19 +705,32 @@ impl TabVoice {
         cup_path.push(egui::pos2(cx + 5.5 * scale, cy - 2.0 * scale));
         ui.painter().add(egui::Shape::line(cup_path, stroke));
 
-        ui.painter().line_segment([egui::pos2(cx, cy + 4.5 * scale), egui::pos2(cx, cy + 8.0 * scale)], stroke);
-        ui.painter().line_segment([egui::pos2(cx - 4.0 * scale, cy + 8.0 * scale), egui::pos2(cx + 4.0 * scale, cy + 8.0 * scale)], stroke);
+        ui.painter().line_segment(
+            [
+                egui::pos2(cx, cy + 4.5 * scale),
+                egui::pos2(cx, cy + 8.0 * scale),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(cx - 4.0 * scale, cy + 8.0 * scale),
+                egui::pos2(cx + 4.0 * scale, cy + 8.0 * scale),
+            ],
+            stroke,
+        );
     }
 
     fn draw_waveform(&self, ui: &mut egui::Ui, is_dark: bool) {
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-        
+        let (rect, _response) =
+            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+
         // Ambil amplitude terbaru
         let latest_amp = self.amp_history.back().copied().unwrap_or(0.0);
-        
+
         // Boost sensitivity and smooth it
         let amp = (latest_amp * 25.0).clamp(0.0, 1.0).sqrt();
-        
+
         let pad = 2.0;
         let inner_w = 14.0;
         let inner_h = 14.0;
@@ -606,16 +739,16 @@ impl TabVoice {
         let baseline_y = rect.min.y + pad + inner_h * 0.5;
 
         for i in 0..WAVEFORM_BARS {
-            // Berikan variasi tinggi untuk tiap bar menggunakan fungsi sinus berdasarkan frame, 
+            // Berikan variasi tinggi untuk tiap bar menggunakan fungsi sinus berdasarkan frame,
             // tapi amplitudonya tetap dikontrol oleh seberapa keras suara (amp).
             let phase = (self.frame as f32 * 0.25) + (i as f32 * 2.0);
             let wave_mult = 0.5 + 0.5 * phase.sin(); // berosilasi antara 0.0 - 1.0
-            
+
             // Base height 2.5px agar bar tetap terlihat saat diam.
             // Saat bersuara, tingginya ditambah animasi osilasi.
             let active_h = amp * wave_mult * (inner_h - 2.5);
             let bar_h = 2.5 + active_h;
-            
+
             // Alpha berdenyut sedikit seiring dengan volume
             let alpha = (0.4 + 0.6 * amp) * 255.0;
             let color = if is_dark {
@@ -623,11 +756,14 @@ impl TabVoice {
             } else {
                 egui::Color32::from_rgba_unmultiplied(51, 115, 242, alpha as u8)
             };
-            
+
             let x_center = rect.min.x + pad + i as f32 * slot + slot * 0.5;
             ui.painter().line_segment(
-                [egui::pos2(x_center, baseline_y - bar_h * 0.5), egui::pos2(x_center, baseline_y + bar_h * 0.5)],
-                egui::Stroke::new(bar_w, color)
+                [
+                    egui::pos2(x_center, baseline_y - bar_h * 0.5),
+                    egui::pos2(x_center, baseline_y + bar_h * 0.5),
+                ],
+                egui::Stroke::new(bar_w, color),
             );
         }
     }
@@ -650,30 +786,44 @@ impl TabVoice {
         );
     }
 
-    fn show_settings(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, _eframe: &mut eframe::Frame) {
+    fn show_settings(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        _eframe: &mut eframe::Frame,
+    ) {
         let panel_rect = ui.max_rect().shrink(16.0);
         let mut ui = ui.child_ui(panel_rect, egui::Layout::top_down(egui::Align::Center));
-        
-        let interact = ui.interact(ui.max_rect(), ui.id().with("drag_settings"), egui::Sense::drag());
+
+        let interact = ui.interact(
+            ui.max_rect(),
+            ui.id().with("drag_settings"),
+            egui::Sense::drag(),
+        );
         if interact.dragged() {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
-        let is_dark = self.state.settings.lock().unwrap_or_else(|e| e.into_inner()).dark_mode;
-        
+        let is_dark = self
+            .state
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dark_mode;
+
         let (bg_color, _stroke_color, text_color, header_color) = if is_dark {
             (
                 egui::Color32::from_rgba_unmultiplied(40, 40, 40, 245),
                 egui::Color32::from_rgba_unmultiplied(100, 150, 255, 140),
                 egui::Color32::from_rgb(200, 210, 220),
-                egui::Color32::from_rgb(120, 170, 255)
+                egui::Color32::from_rgb(120, 170, 255),
             )
         } else {
             (
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 245),
                 egui::Color32::from_rgba_unmultiplied(51, 89, 217, 140),
                 egui::Color32::from_rgb(64, 76, 102),
-                egui::Color32::from_rgb(51, 89, 217)
+                egui::Color32::from_rgb(51, 89, 217),
             )
         };
 
@@ -684,7 +834,11 @@ impl TabVoice {
             .inner_margin(16.0);
 
         frame.show(&mut ui, |ui| {
-            ui.label(egui::RichText::new("TabVoice Settings").size(15.0).color(header_color));
+            ui.label(
+                egui::RichText::new("TabVoice Settings")
+                    .size(15.0)
+                    .color(header_color),
+            );
             ui.add_space(12.0);
 
             egui::Grid::new("settings_grid")
@@ -697,7 +851,11 @@ impl TabVoice {
                         .width(180.0)
                         .selected_text(&self.temp_device_name)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.temp_device_name, "System Default".to_string(), "System Default");
+                            ui.selectable_value(
+                                &mut self.temp_device_name,
+                                "System Default".to_string(),
+                                "System Default",
+                            );
                             for m in &self.available_microphones {
                                 ui.selectable_value(&mut self.temp_device_name, m.clone(), m);
                             }
@@ -716,21 +874,28 @@ impl TabVoice {
                     ui.end_row();
 
                     ui.label(egui::RichText::new("Language Hint").color(text_color));
-                    
-                    static SUPPORTED_LANGUAGES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-                    let lang_options = SUPPORTED_LANGUAGES.get_or_init(|| crate::ffi::get_supported_languages());
-                    
-                    let current_lang_name = lang_options.iter()
+
+                    static SUPPORTED_LANGUAGES: std::sync::OnceLock<Vec<(String, String)>> =
+                        std::sync::OnceLock::new();
+                    let lang_options =
+                        SUPPORTED_LANGUAGES.get_or_init(|| crate::ffi::get_supported_languages());
+
+                    let current_lang_name = lang_options
+                        .iter()
                         .find(|(code, _)| *code == self.temp_language)
                         .map(|(_, name)| name.as_str())
                         .unwrap_or("Auto Detect");
-                        
+
                     egui::ComboBox::from_id_source("lang_combo")
                         .width(180.0)
                         .selected_text(current_lang_name)
                         .show_ui(ui, |ui| {
                             for (code, name) in lang_options {
-                                ui.selectable_value(&mut self.temp_language, code.to_string(), name);
+                                ui.selectable_value(
+                                    &mut self.temp_language,
+                                    code.to_string(),
+                                    name,
+                                );
                             }
                         });
                     ui.end_row();
@@ -745,9 +910,15 @@ impl TabVoice {
                             ctx.input(|i| {
                                 // Susun daftar modifier dari status yang sedang dipegang.
                                 let mut mods: Vec<&str> = Vec::new();
-                                if i.modifiers.ctrl { mods.push("Ctrl"); }
-                                if i.modifiers.shift { mods.push("Shift"); }
-                                if i.modifiers.alt { mods.push("Alt"); }
+                                if i.modifiers.ctrl {
+                                    mods.push("Ctrl");
+                                }
+                                if i.modifiers.shift {
+                                    mods.push("Shift");
+                                }
+                                if i.modifiers.alt {
+                                    mods.push("Alt");
+                                }
 
                                 // Ambil tombol utama (bukan modifier) yang sedang ditekan.
                                 // egui sudah memisahkan modifier dari `keys_down`, jadi kita
@@ -762,7 +933,8 @@ impl TabVoice {
                                     if crate::hotkey::parse_hotkey_string(&candidate).is_some() {
                                         self.temp_hotkey = candidate;
                                         self.assigning_hotkey = false;
-                                        IS_ASSIGNING_HOTKEY.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        IS_ASSIGNING_HOTKEY
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             });
@@ -787,23 +959,51 @@ impl TabVoice {
                     ui.label(egui::RichText::new("Memory Mode").color(text_color));
                     let current_memory_name = match self.temp_memory_mode {
                         crate::settings::MemoryMode::LoadOnStartup => "Load on Startup (Instan)",
-                        crate::settings::MemoryMode::LoadOnFirstUse => "Load on First Use (Hemat RAM)",
+                        crate::settings::MemoryMode::LoadOnFirstUse => {
+                            "Load on First Use (Hemat RAM)"
+                        }
                         crate::settings::MemoryMode::EcoMode => "Eco Mode (Auto-Unload)",
                     };
                     egui::ComboBox::from_id_source("memory_combo")
                         .width(180.0)
                         .selected_text(current_memory_name)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.temp_memory_mode, crate::settings::MemoryMode::LoadOnStartup, "Load on Startup (Instan)");
-                            ui.selectable_value(&mut self.temp_memory_mode, crate::settings::MemoryMode::LoadOnFirstUse, "Load on First Use (Hemat RAM)");
-                            ui.selectable_value(&mut self.temp_memory_mode, crate::settings::MemoryMode::EcoMode, "Eco Mode (Auto-Unload)");
+                            ui.selectable_value(
+                                &mut self.temp_memory_mode,
+                                crate::settings::MemoryMode::LoadOnStartup,
+                                "Load on Startup (Instan)",
+                            );
+                            ui.selectable_value(
+                                &mut self.temp_memory_mode,
+                                crate::settings::MemoryMode::LoadOnFirstUse,
+                                "Load on First Use (Hemat RAM)",
+                            );
+                            ui.selectable_value(
+                                &mut self.temp_memory_mode,
+                                crate::settings::MemoryMode::EcoMode,
+                                "Eco Mode (Auto-Unload)",
+                            );
                         });
                     ui.end_row();
 
                     ui.label("Anti-Hallucination:");
-                    ui.add(egui::Slider::new(&mut self.temp_vad_threshold, 0.0..=0.05)
-                        .text("Silence cutoff (VAD)")
-                        .step_by(0.001));
+                    ui.add(
+                        egui::Slider::new(&mut self.temp_vad_threshold, 0.0..=0.05)
+                            .text("Silence cutoff (VAD)")
+                            .step_by(0.001),
+                    );
+                    ui.end_row();
+
+                    ui.label("");
+                    ui.checkbox(&mut self.temp_vad_enabled, "Enable VAD (filter silence)");
+                    ui.end_row();
+
+                    ui.label("Voice Boost:");
+                    ui.add(
+                        egui::Slider::new(&mut self.temp_boost_gain, 1.0..=10.0)
+                            .text("Gain (mic jauh)")
+                            .step_by(0.5),
+                    );
                     ui.end_row();
 
                     ui.label("");
@@ -816,21 +1016,34 @@ impl TabVoice {
                 });
 
             ui.add_space(16.0);
-            
+
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Save").clicked() {
                         let mut new_settings = crate::settings::Settings {
-                            model_path: crate::settings::get_models_dir().join(&self.temp_model_path),
-                            language: if self.temp_language == "auto" || self.temp_language.trim().is_empty() { None } else { Some(self.temp_language.trim().to_string()) },
+                            model_path: crate::settings::get_models_dir()
+                                .join(&self.temp_model_path),
+                            language: if self.temp_language == "auto"
+                                || self.temp_language.trim().is_empty()
+                            {
+                                None
+                            } else {
+                                Some(self.temp_language.trim().to_string())
+                            },
                             hotkey: self.temp_hotkey.clone(),
                             paste_on_release: self.temp_paste,
-                            device_name: if self.temp_device_name == "System Default" { None } else { Some(self.temp_device_name.clone()) },
+                            device_name: if self.temp_device_name == "System Default" {
+                                None
+                            } else {
+                                Some(self.temp_device_name.clone())
+                            },
                             dark_mode: self.temp_dark_mode,
                             realtime: self.temp_realtime,
                             auto_start: self.temp_auto_start,
                             memory_mode: self.temp_memory_mode,
                             vad_threshold: self.temp_vad_threshold,
+                            vad_enabled: self.temp_vad_enabled,
+                            boost_gain: self.temp_boost_gain,
                         };
 
                         // Coba ganti shortcut global. Kalau gagal (format salah /
@@ -850,9 +1063,13 @@ impl TabVoice {
                         if let Err(e) = crate::settings::save(&new_settings) {
                             log::error!("Gagal menyimpan settings: {e}");
                         }
-                        *self.state.settings.lock().unwrap_or_else(|e| e.into_inner()) = new_settings;
+                        *self
+                            .state
+                            .settings
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = new_settings;
                         self.mode = UiMode::Idle;
-                        
+
                         // Otomatis trigger reload/download model yang baru disimpan!
                         self.handle_tray(TrayAction::ReloadModel);
                     }
@@ -877,15 +1094,54 @@ fn egui_key_to_hotkey_token(key: &egui::Key) -> Option<&'static str> {
         Escape => "Esc",
         Backspace => "Backspace",
         Space => "Space",
-        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4",
-        F5 => "F5", F6 => "F6", F7 => "F7", F8 => "F8",
-        F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
-        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F", G => "G",
-        H => "H", I => "I", J => "J", K => "K", L => "L", M => "M", N => "N",
-        O => "O", P => "P", Q => "Q", R => "R", S => "S", T => "T", U => "U",
-        V => "V", W => "W", X => "X", Y => "Y", Z => "Z",
-        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
-        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
+        F1 => "F1",
+        F2 => "F2",
+        F3 => "F3",
+        F4 => "F4",
+        F5 => "F5",
+        F6 => "F6",
+        F7 => "F7",
+        F8 => "F8",
+        F9 => "F9",
+        F10 => "F10",
+        F11 => "F11",
+        F12 => "F12",
+        A => "A",
+        B => "B",
+        C => "C",
+        D => "D",
+        E => "E",
+        F => "F",
+        G => "G",
+        H => "H",
+        I => "I",
+        J => "J",
+        K => "K",
+        L => "L",
+        M => "M",
+        N => "N",
+        O => "O",
+        P => "P",
+        Q => "Q",
+        R => "R",
+        S => "S",
+        T => "T",
+        U => "U",
+        V => "V",
+        W => "W",
+        X => "X",
+        Y => "Y",
+        Z => "Z",
+        Num0 => "0",
+        Num1 => "1",
+        Num2 => "2",
+        Num3 => "3",
+        Num4 => "4",
+        Num5 => "5",
+        Num6 => "6",
+        Num7 => "7",
+        Num8 => "8",
+        Num9 => "9",
         _ => return None,
     })
 }

@@ -4,7 +4,12 @@
 //! Semua panggilan ke whisper.cpp lewat binding `bindgen` yang di-generate
 //! di build.rs → `$OUT_DIR/whisper_bindings.rs`.
 
-#![allow(non_camel_case_types, non_snake_case, dead_code, non_upper_case_globals)]
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    non_upper_case_globals
+)]
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -35,7 +40,10 @@ impl fmt::Display for WhisperError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WhisperError::InitFailed => {
-                write!(f, "whisper context init returned null (file not found or invalid)")
+                write!(
+                    f,
+                    "whisper context init returned null (file not found or invalid)"
+                )
             }
             WhisperError::InferenceFailed(rc) => {
                 write!(f, "whisper_full returned code: {rc}")
@@ -70,7 +78,9 @@ pub struct WhisperOptions {
 
 impl Default for WhisperOptions {
     fn default() -> Self {
-        let max_threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
+        let max_threads = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4);
         let optimal_threads = (max_threads / 2).max(1).min(8);
         Self {
             language: None,
@@ -78,7 +88,7 @@ impl Default for WhisperOptions {
             temperature: 0.0,
             timestamps: false,
             initial_prompt: None,
-            // Menggunakan physical core count (approx: logical / 2) lebih efisien 
+            // Menggunakan physical core count (approx: logical / 2) lebih efisien
             // daripada memaksa semua logical core (hyperthreading justru menurunkan performa GGML)
             n_threads: optimal_threads,
         }
@@ -127,11 +137,9 @@ impl WhisperModel {
         let cpath = CString::new(path.to_str().ok_or(WhisperError::Utf8)?)
             .map_err(|_| WhisperError::PathNul)?;
         let params = unsafe { bindings::whisper_context_default_params() };
-        let ctx = unsafe {
-            bindings::whisper_init_from_file_with_params(cpath.as_ptr(), params)
-        };
+        let ctx = unsafe { bindings::whisper_init_from_file_with_params(cpath.as_ptr(), params) };
         NonNull::new(ctx)
-            .map(|ctx| WhisperModel { 
+            .map(|ctx| WhisperModel {
                 ctx,
                 inference_lock: Mutex::new(()),
             })
@@ -150,7 +158,7 @@ impl WhisperModel {
             )
         };
         NonNull::new(ctx)
-            .map(|ctx| WhisperModel { 
+            .map(|ctx| WhisperModel {
                 ctx,
                 inference_lock: Mutex::new(()),
             })
@@ -158,11 +166,7 @@ impl WhisperModel {
     }
 
     /// Quick helper: cuma ambil text hasil (tanpa segment detail).
-    pub fn transcribe(
-        &self,
-        audio: &[f32],
-        opts: &WhisperOptions,
-    ) -> Result<String, WhisperError> {
+    pub fn transcribe(&self, audio: &[f32], opts: &WhisperOptions) -> Result<String, WhisperError> {
         let result = self.transcribe_full(audio, opts)?;
         Ok(result.text)
     }
@@ -174,7 +178,8 @@ impl WhisperModel {
         opts: &WhisperOptions,
     ) -> Result<TranscribeResult, WhisperError> {
         // Serialisasi akses ke whisper context — hanya satu inference pada satu waktu.
-        let _inference_guard = self.inference_lock
+        let _inference_guard = self
+            .inference_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -246,25 +251,18 @@ impl WhisperModel {
         let mut full_text = String::new();
 
         for i in 0..n {
-            let c_text =
-                unsafe { bindings::whisper_full_get_segment_text(self.ctx.as_ptr(), i) };
+            let c_text = unsafe { bindings::whisper_full_get_segment_text(self.ctx.as_ptr(), i) };
             let text = unsafe { cstr_to_string(c_text)? };
 
-            let t0_cs =
-                unsafe { bindings::whisper_full_get_segment_t0(self.ctx.as_ptr(), i) };
-            let t1_cs =
-                unsafe { bindings::whisper_full_get_segment_t1(self.ctx.as_ptr(), i) };
-            let no_sp = unsafe {
-                bindings::whisper_full_get_segment_no_speech_prob(self.ctx.as_ptr(), i)
-            };
+            let t0_cs = unsafe { bindings::whisper_full_get_segment_t0(self.ctx.as_ptr(), i) };
+            let t1_cs = unsafe { bindings::whisper_full_get_segment_t1(self.ctx.as_ptr(), i) };
+            let no_sp =
+                unsafe { bindings::whisper_full_get_segment_no_speech_prob(self.ctx.as_ptr(), i) };
 
-            let n_tokens =
-                unsafe { bindings::whisper_full_n_tokens(self.ctx.as_ptr(), i) };
+            let n_tokens = unsafe { bindings::whisper_full_n_tokens(self.ctx.as_ptr(), i) };
             let mut sum_p = 0.0_f32;
             for j in 0..n_tokens {
-                sum_p += unsafe {
-                    bindings::whisper_full_get_token_p(self.ctx.as_ptr(), i, j)
-                };
+                sum_p += unsafe { bindings::whisper_full_get_token_p(self.ctx.as_ptr(), i, j) };
             }
             let confidence = if n_tokens > 0 {
                 sum_p / n_tokens as f32
@@ -373,9 +371,13 @@ pub fn get_supported_languages() -> Vec<(String, String)> {
             let str_ptr = bindings::whisper_lang_str(id);
             let full_ptr = bindings::whisper_lang_str_full(id);
             if !str_ptr.is_null() && !full_ptr.is_null() {
-                let code = std::ffi::CStr::from_ptr(str_ptr).to_string_lossy().to_string();
-                let name = std::ffi::CStr::from_ptr(full_ptr).to_string_lossy().to_string();
-                
+                let code = std::ffi::CStr::from_ptr(str_ptr)
+                    .to_string_lossy()
+                    .to_string();
+                let name = std::ffi::CStr::from_ptr(full_ptr)
+                    .to_string_lossy()
+                    .to_string();
+
                 // Jangan masukkan "auto" di loop, kita taruh di atas nanti
                 if code != "auto" {
                     // Capitalize the first letter
@@ -393,13 +395,13 @@ pub fn get_supported_languages() -> Vec<(String, String)> {
             }
         }
     }
-    
+
     // Sort alphabetically by name
     langs.sort_by(|a, b| a.1.cmp(&b.1));
-    
+
     // Taruh auto detect di paling atas
     langs.insert(0, ("auto".to_string(), "Auto Detect".to_string()));
-    
+
     langs
 }
 

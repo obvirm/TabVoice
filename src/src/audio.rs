@@ -11,8 +11,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 
 use rubato::{
-    calculate_cutoff, Resampler, SincFixedIn, SincInterpolationParameters,
-    SincInterpolationType, WindowFunction,
+    calculate_cutoff, Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
 
 /// Sample rate target Whisper (16 kHz mono PCM f32).
@@ -114,10 +114,11 @@ impl StreamingResampler {
                 break;
             }
             self.outbuf[0].resize(out_frames, 0.0);
-            match self
-                .resampler
-                .process_partial_into_buffer(None::<&[&[f32]]>, &mut self.outbuf, None)
-            {
+            match self.resampler.process_partial_into_buffer(
+                None::<&[&[f32]]>,
+                &mut self.outbuf,
+                None,
+            ) {
                 Ok((_n_in, n_out)) => {
                     output.extend_from_slice(&self.outbuf[0]);
                     if n_out == 0 {

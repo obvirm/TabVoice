@@ -4496,6 +4496,8 @@ dependencies = [
  "enigo",
  "env_logger",
  "global-hotkey",
+ "gtk",
+ "image 0.25.10",
  "log",
  "reqwest",
  "rubato",

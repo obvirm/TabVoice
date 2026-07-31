@@ -58,6 +58,17 @@ pub struct Settings {
     /// Nilai default: 0.005. Jika suara lebih rendah dari ini, akan diabaikan (mencegah halusinasi).
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
+
+    /// Master switch Voice Activity Detection.
+    /// Kalau `false`, semua audio langsung ditranskrip tanpa filter hening
+    /// (berguna kalau mic pelan / sering kena "No speech detected" palsu).
+    #[serde(default = "default_vad_enabled")]
+    pub vad_enabled: bool,
+
+    /// Penguat suara (gain) sebelum VAD & transkripsi.
+    /// 1.0 = normal, >1.0 = memperkeras (buat mic yang jauh/pelan).
+    #[serde(default = "default_boost_gain")]
+    pub boost_gain: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -70,6 +81,14 @@ pub enum MemoryMode {
 
 fn default_vad_threshold() -> f32 {
     0.005
+}
+
+fn default_vad_enabled() -> bool {
+    true
+}
+
+fn default_boost_gain() -> f32 {
+    1.0
 }
 
 /// Mendapatkan absolute path ke folder `models/` di direktori yang sama dengan executable.
@@ -94,6 +113,8 @@ impl Default for Settings {
             auto_start: false,
             memory_mode: MemoryMode::LoadOnFirstUse, // Default ke hemat RAM
             vad_threshold: default_vad_threshold(),
+            vad_enabled: default_vad_enabled(),
+            boost_gain: default_boost_gain(),
         }
     }
 }
@@ -129,7 +150,10 @@ fn ensure_parent(path: &Path) -> Result<()> {
 pub fn load_or_default() -> Settings {
     let path = config_path();
     if !path.exists() {
-        log::info!("Settings file not found at {}, using defaults", path.display());
+        log::info!(
+            "Settings file not found at {}, using defaults",
+            path.display()
+        );
         return Settings::default();
     }
 
@@ -154,16 +178,16 @@ pub fn load_or_default() -> Settings {
             Settings::default()
         }
     };
-    
+
     // Pastikan `model_path` selalu menggunakan folder `models/` di dekat exe.
-    // Jika user punya file lama dengan format "models/ggml-base.bin", kita 
+    // Jika user punya file lama dengan format "models/ggml-base.bin", kita
     // ambil nama filenya saja lalu satukan dengan `get_models_dir()`.
     if let Some(file_name) = loaded.model_path.file_name() {
         loaded.model_path = get_models_dir().join(file_name);
     } else {
         loaded.model_path = get_models_dir().join("ggml-base.bin");
     }
-    
+
     loaded
 }
 
@@ -176,27 +200,34 @@ pub fn save(s: &Settings) -> Result<()> {
     std::fs::write(&path, serialized)
         .with_context(|| format!("writing settings to {}", path.display()))?;
     log::info!("Saved settings to {}", path.display());
-    
+
     // Apply auto_start to Windows Registry
     apply_auto_start(s.auto_start);
-    
+
     Ok(())
 }
 
-/// Menambah atau menghapus TabVoice dari Windows Startup (Registry)
+/// Menambah atau menghapus TabVoice dari Windows Startup (Registry).
+/// Windows only — no-op di platform lain.
+#[cfg(windows)]
 pub fn apply_auto_start(enable: bool) {
-    let Ok(exe_path) = std::env::current_exe() else { return };
+    let Ok(exe_path) = std::env::current_exe() else {
+        return;
+    };
     let exe_path_str = exe_path.display().to_string();
-    
+
     if enable {
         let _ = std::process::Command::new("reg")
             .args([
                 "add",
                 "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                "/v", "TabVoice",
-                "/t", "REG_SZ",
-                "/d", &exe_path_str,
-                "/f"
+                "/v",
+                "TabVoice",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &exe_path_str,
+                "/f",
             ])
             .spawn();
         log::info!("Registered to Windows Startup");
@@ -205,12 +236,18 @@ pub fn apply_auto_start(enable: bool) {
             .args([
                 "delete",
                 "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                "/v", "TabVoice",
-                "/f"
+                "/v",
+                "TabVoice",
+                "/f",
             ])
             .spawn();
         log::info!("Removed from Windows Startup");
     }
+}
+
+#[cfg(not(windows))]
+pub fn apply_auto_start(_enable: bool) {
+    // No-op: autostart via registry tidak ada di platform non-Windows.
 }
 
 #[cfg(test)]

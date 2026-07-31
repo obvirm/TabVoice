@@ -4,7 +4,7 @@
 //! callback, dan transcriber worker. Karena semua field di belakang `Mutex`,
 //! lock critical section diusahakan pendek (drop guard pattern).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
