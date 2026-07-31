@@ -137,7 +137,8 @@ jobs:
             pulseaudio pulseaudio-utils \
             libasound2-plugins alsa-utils \
             ffmpeg \
-            libgtk-3-0 libappindicator3-1
+            libgtk-3-0 libappindicator3-1 \
+            libxkbcommon0 libxkbcommon-x11-0
 
       - uses: actions/download-artifact@v4
         with:
